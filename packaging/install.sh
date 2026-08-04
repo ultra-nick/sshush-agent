@@ -113,6 +113,14 @@ systemctl stop sshush-agent.service >/dev/null 2>&1 || :
 
 # ---------------------------------------------------------------- install
 
+# install(1), never mv or cp -a. On SELinux-enforcing hosts (RHEL family) the
+# unpacked payload under /root carries the admin_home_t label; mv is a rename,
+# so the label survives into /usr/local/bin and systemd then refuses to exec
+# the binary (status=203/EXEC) while ls -l shows a perfect layout. install
+# creates a new file, so the target directory's type transition applies
+# (bin_t / systemd_unit_file_t) and no restorecon is needed. Verified both
+# ways on Rocky 9 with SELinux enforcing; diagnose any recurrence with
+# `ausearch -m avc -ts recent < /dev/null`, not the journal.
 install -o root -g root -m 0755 "$SCRIPT_DIR/sshush-agent" "$BIN_DIR/sshush-agent"
 install -o root -g root -m 0700 "$SCRIPT_DIR/sshush-uninstall" "$BIN_DIR/sshush-uninstall"
 
