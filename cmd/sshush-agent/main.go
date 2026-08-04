@@ -1,52 +1,259 @@
 // Command sshush-agent is the SSHush server-side agent.
 //
-// This is a stub. It exists so sshush-agent.service has a real process to
-// supervise while the install and removal layer is built out. It reads no
-// configuration, opens no sockets, and touches no files.
+// It reads its identity from /etc/sshush/config.json once at startup, then
+// does exactly one thing forever: POST a heartbeat to the backend every
+// interval. It ignores every response and every error - no retry, no backoff,
+// no state machine, no reaction to any status code. The next beat is always
+// one interval away.
 //
-// On SIGTERM or SIGINT it returns from main, exiting 0. That matters to the
-// unit: Restart=on-failure means a clean exit leaves the service stopped
-// rather than looping.
+// That rule is the single most important one in this program. The backend
+// infers presence from beats arriving and absence from beats stopping, so any
+// intelligence added here - retries, buffering, response handling - would only
+// blur the one signal the agent exists to send, and would turn the easiest
+// component to audit into one that needs auditing. Resist it.
+//
+// On SIGTERM or SIGINT it exits 0, mid-beat or not. The unit uses
+// Restart=on-failure, so a clean stop stays stopped.
 package main
 
 import (
+	"bytes"
 	"context"
-	"log"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"flag"
+	"fmt"
+	"io"
+	"log/slog"
+	mrand "math/rand/v2"
+	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 )
 
-// Deliberately not called a heartbeat. This only writes a line to the journal;
-// there is no protocol, no peer, and nothing goes over the wire. The heartbeat
-// is a separate piece of work that does not exist yet, and reusing the word here
-// would make later readers think it had already been built and tested.
-const livenessLogInterval = 60 * time.Second
+const (
+	configPath = "/etc/sshush/config.json"
+
+	// beatTimeout bounds one POST. Config validation keeps every interval at
+	// or above minIntervalS, so a request that runs to the full timeout still
+	// completes well before the next beat is due - beats can never stack.
+	beatTimeout  = 10 * time.Second
+	minIntervalS = 30
+
+	secretLen = 32
+)
+
+// config is the agent's identity, read once. It is never reloaded: when it
+// changes, the app restarts the agent over SSH. No file watching.
+type config struct {
+	AgentID   string `json:"agent_id"`
+	Secret    string `json:"secret"`
+	IntervalS int    `json:"interval_s"`
+	Endpoint  string `json:"endpoint"`
+}
 
 func main() {
-	// systemd stamps its own timestamp and unit name onto every journal line,
-	// so emit bare messages rather than duplicating that.
-	log.SetFlags(0)
-	log.SetOutput(os.Stdout)
+	insecure := flag.Bool("insecure", false,
+		"permit a plain-http endpoint (testing only: the secret crosses the network unencrypted)")
+	flag.Parse()
+
+	log := newLogger()
+
+	cfg, err := loadConfig(*insecure)
+	if err != nil {
+		// An agent with no identity has nothing useful to do. Exit non-zero
+		// and let systemd retry; the message names what is wrong and where.
+		log.Error("configuration rejected", "error", err.Error())
+		os.Exit(1)
+	}
+
+	if strings.HasPrefix(cfg.Endpoint, "http:") {
+		log.Warn("--insecure: the beat secret crosses the network unencrypted",
+			"endpoint", cfg.Endpoint)
+	}
+
+	// The body never changes, so it is built exactly once. This is the only
+	// place the secret leaves the process, and it leaves only toward the
+	// endpoint - never toward a log, on any path.
+	body, err := json.Marshal(map[string]string{
+		"agent_id": cfg.AgentID,
+		"secret":   cfg.Secret,
+	})
+	if err != nil {
+		log.Error("building beat body failed", "error", err.Error())
+		os.Exit(1)
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	// Log once on start so the journal shows the process came up, without
-	// waiting a full interval for the first line.
-	log.Print("sshush-agent alive")
+	client := &http.Client{Timeout: beatTimeout}
+	interval := time.Duration(cfg.IntervalS) * time.Second
 
-	ticker := time.NewTicker(livenessLogInterval)
-	defer ticker.Stop()
+	log.Info("sshush-agent starting",
+		"agent_id", cfg.AgentID, "endpoint", cfg.Endpoint, "interval", interval)
+
+	// First beat immediately rather than one interval from now: a restarted
+	// agent should announce itself at once. The backend's "heartbeat resumed"
+	// is only as prompt as the first beat after a restart.
+	beat(ctx, client, cfg.Endpoint, body, log)
 
 	for {
 		select {
 		case <-ctx.Done():
-			log.Print("sshush-agent stopping")
+			log.Info("sshush-agent stopping")
 			return
-		case <-ticker.C:
-			log.Print("sshush-agent alive")
+		case <-time.After(jitter(interval)):
+		}
+		// The wait above starts only after the previous beat has returned
+		// (bounded by beatTimeout), so the interval is measured from last
+		// completion and "skip if still in flight" holds by construction -
+		// no bookkeeping required.
+		beat(ctx, client, cfg.Endpoint, body, log)
+	}
+}
+
+// beat sends one heartbeat and deliberately discards the outcome.
+//
+// The status code is logged at debug and acted on by no one. The request
+// context is the process context, so SIGTERM mid-beat aborts the request and
+// the loop exits cleanly.
+func beat(ctx context.Context, client *http.Client, endpoint string, body []byte, log *slog.Logger) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		log.Debug("beat", "outcome", "request_build_failed", "error", err.Error())
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		// Transport errors name the endpoint and the network condition; they
+		// never contain the request body, so the secret stays out of the
+		// journal here too.
+		log.Debug("beat", "outcome", "send_failed", "error", err.Error())
+		return
+	}
+	// Drain a bounded amount so the connection can be reused, then move on.
+	_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	_ = resp.Body.Close()
+
+	log.Debug("beat", "outcome", resp.StatusCode)
+}
+
+// loadConfig reads and validates the identity file.
+//
+// Every error message names the offending field but never echoes its value:
+// the secret must not reach a terminal or the journal on any path, and that
+// includes configuration failures.
+func loadConfig(insecureOK bool) (config, error) {
+	raw, err := os.ReadFile(configPath)
+	if err != nil {
+		return config{}, fmt.Errorf("read %s: %w (enrolment or the installer places this file)", configPath, err)
+	}
+
+	var cfg config
+	if err := json.Unmarshal(raw, &cfg); err != nil {
+		return config{}, fmt.Errorf("parse %s: %w", configPath, err)
+	}
+
+	if !validUUID(cfg.AgentID) {
+		return config{}, fmt.Errorf("%s: agent_id is not a canonical hyphenated uuid", configPath)
+	}
+	if !validSecret(cfg.Secret) {
+		return config{}, fmt.Errorf("%s: secret does not decode to exactly %d bytes of base64url", configPath, secretLen)
+	}
+	if cfg.IntervalS < minIntervalS {
+		// The floor keeps the fixed request timeout well under every
+		// interval, which is what makes overlapping beats impossible.
+		return config{}, fmt.Errorf("%s: interval_s must be at least %d, got %d", configPath, minIntervalS, cfg.IntervalS)
+	}
+
+	u, err := url.Parse(cfg.Endpoint)
+	if err != nil || u.Host == "" {
+		return config{}, fmt.Errorf("%s: endpoint is not a valid url", configPath)
+	}
+	switch u.Scheme {
+	case "https":
+		// The only acceptable production transport.
+	case "http":
+		if !insecureOK {
+			return config{}, fmt.Errorf("%s: endpoint is plain http, which would send the secret unencrypted; use https, or pass --insecure to accept that on a test network", configPath)
+		}
+	default:
+		return config{}, fmt.Errorf("%s: endpoint scheme must be https (or http with --insecure)", configPath)
+	}
+
+	return cfg, nil
+}
+
+// validUUID accepts the canonical 8-4-4-4-12 hyphenated form only, matching
+// what the backend's parser accepts. No braces, no urn: prefix.
+func validUUID(s string) bool {
+	if len(s) != 36 || s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-' {
+		return false
+	}
+	compact := s[0:8] + s[9:13] + s[14:18] + s[19:23] + s[24:36]
+	_, err := hex.DecodeString(compact)
+	return err == nil
+}
+
+// validSecret accepts base64url with or without padding, exactly secretLen
+// decoded bytes. The decoded value is discarded - the agent sends the string
+// as received and never needs the raw bytes.
+func validSecret(s string) bool {
+	raw, err := base64.RawURLEncoding.DecodeString(s)
+	if err != nil {
+		raw, err = base64.URLEncoding.DecodeString(s)
+		if err != nil {
+			return false
 		}
 	}
+	return len(raw) == secretLen
+}
+
+// newLogger builds a stdout slog with the level taken from SSHUSH_LOG_LEVEL
+// (default info). Per-beat outcomes log at debug, so a normally-configured
+// agent journals only lifecycle events. The time attribute is dropped -
+// journald stamps every line already.
+func newLogger() *slog.Logger {
+	var level slog.Level
+	switch strings.ToLower(os.Getenv("SSHUSH_LOG_LEVEL")) {
+	case "debug":
+		level = slog.LevelDebug
+	case "warn":
+		level = slog.LevelWarn
+	case "error":
+		level = slog.LevelError
+	default:
+		level = slog.LevelInfo
+	}
+	return slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: level,
+		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
+			if a.Key == slog.TimeKey {
+				return slog.Attr{}
+			}
+			return a
+		},
+	}))
+}
+
+// jitter spreads beats by +-10% so a fleet of agents installed at the same
+// moment does not hit the backend in lockstep forever.
+func jitter(d time.Duration) time.Duration {
+	if d <= 0 {
+		return d
+	}
+	delta := (mrand.Float64()*2 - 1) * 0.1 * float64(d)
+	out := time.Duration(float64(d) + delta)
+	if out <= 0 {
+		return d
+	}
+	return out
 }

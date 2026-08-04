@@ -134,6 +134,20 @@ install -o root -g root -m 0644 "$SCRIPT_DIR/sshush-uninstall.service" "$UNIT_DI
 install -d -o root -g "$AGENT_GROUP" -m 0750 "$CONF_DIR"
 install -d -o "$AGENT_USER" -g "$AGENT_GROUP" -m 0750 "$STATE_DIR"
 
+# The agent's identity file. Enrolment will write this eventually; until then
+# a config.json shipped next to install.sh is placed here. Root-owned and
+# group-readable: the agent reads it, only root can change it. It holds the
+# beat secret, so it is never world-readable.
+CONFIG_PLACED=no
+if [ -f "$SCRIPT_DIR/config.json" ]; then
+	install -o root -g "$AGENT_GROUP" -m 0640 "$SCRIPT_DIR/config.json" "$CONF_DIR/config.json"
+	CONFIG_PLACED=yes
+elif [ ! -f "$CONF_DIR/config.json" ]; then
+	say "WARNING: no config.json shipped and none present at $CONF_DIR/config.json."
+	say "         The agent exits without an identity, and systemd will retry every 10s"
+	say "         until the file exists. Place it and run: systemctl restart sshush-agent"
+fi
+
 # A marker left behind by an interrupted uninstall would fire
 # sshush-uninstall.path the instant it is enabled below, tearing down the
 # install that just completed. Clear it before the watcher goes live.
@@ -163,6 +177,9 @@ row "$UNIT_DIR/sshush-agent.service" "root:root" "0644"
 row "$UNIT_DIR/sshush-uninstall.path" "root:root" "0644"
 row "$UNIT_DIR/sshush-uninstall.service" "root:root" "0644"
 row "$CONF_DIR/" "root:$AGENT_GROUP" "0750  read-only to the agent"
+if [ "$CONFIG_PLACED" = yes ]; then
+	row "$CONF_DIR/config.json" "root:$AGENT_GROUP" "0640  agent identity"
+fi
 row "$STATE_DIR/" "$AGENT_USER:$AGENT_GROUP" "0750  the only writable path"
 row "system user $AGENT_USER" "$NOLOGIN" "no home directory"
 

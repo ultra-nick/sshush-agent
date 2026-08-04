@@ -7,15 +7,36 @@ it. That is the point of it being here.
 
 ## Status: early
 
-**The agent does not do anything yet.** This repository currently contains the install and
-removal layer only. The binary is a stub: it logs a line to the journal every 60 seconds and
-exits cleanly on `SIGTERM`.
+The agent currently does exactly one thing: it sends a **heartbeat**. Every interval it POSTs
+its identity (`agent_id` plus a secret) to the configured backend endpoint, and it ignores
+every response and every error - no retry, no backoff, no reaction to any status code. The
+backend infers presence from beats arriving and absence from beats stopping.
 
-It does **not** yet collect metrics, read configuration, open a network connection, or talk to
-any server. Those come later, and this section will change when they do.
+That is its **only** network activity: one outbound HTTPS POST, to one endpoint you can read
+in `/etc/sshush/config.json`. It does **not** yet collect metrics, and it never listens on any
+port, executes remote commands, or fetches anything. Those boundaries are the point of the
+design; the metrics collection that comes later will widen what the beat carries, not what the
+agent accepts.
 
-What is here is the part worth reviewing first: how the agent is installed, what privileges it
-runs with, and how it is removed.
+The identity file at `/etc/sshush/config.json` (root-owned, group-readable, mode `0640`) is
+read once at startup and never watched or reloaded:
+
+```json
+{
+  "agent_id":   "<uuid>",
+  "secret":     "<base64url, 32 bytes>",
+  "interval_s": 60,
+  "endpoint":   "https://example.com/v1/beat"
+}
+```
+
+The endpoint must be `https://`. The agent refuses to start with a plain-http endpoint unless
+`--insecure` is passed explicitly, because the secret would cross the network unencrypted -
+that is a choice a test environment can make on purpose, not a default anyone can ship by
+accident.
+
+Still worth reviewing first: how the agent is installed, what privileges it runs with, and how
+it is removed.
 
 ## Requirements
 
@@ -59,6 +80,7 @@ overwrites every managed file, and starts them again.
 | `/etc/systemd/system/sshush-uninstall.path` | `root:root` | `0644` |
 | `/etc/systemd/system/sshush-uninstall.service` | `root:root` | `0644` |
 | `/etc/sshush/` | `root:sshush` | `0750` |
+| `/etc/sshush/config.json` (when shipped) | `root:sshush` | `0640` |
 | `/var/lib/sshush/` | `sshush:sshush` | `0750` |
 
 It also creates a system user `sshush` with a `nologin` shell and no home directory.

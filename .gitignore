@@ -1,0 +1,12 @@
+# The agent identity file contains the beat secret. install.sh picks it up
+# from the packaging directory when placing a release, which makes it exactly
+# the kind of file that ends up sitting next to tracked files - and this is a
+# PUBLIC repository, where a committed secret is unrecoverable.
+config.json
+
+# The built binary lands in packaging/ so install.sh can find it. An exact
+# path, so packaging/sshush-agent.service is unaffected.
+packaging/sshush-agent
+
+# macOS
+.DS_Store
