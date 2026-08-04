@@ -26,14 +26,20 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	mrand "math/rand/v2"
 	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
+	"runtime"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/ultra-nick/sshush-agent/internal/metrics"
+	"github.com/ultra-nick/sshush-agent/internal/report"
+	"github.com/ultra-nick/sshush-agent/internal/rules"
 )
 
 const (
@@ -48,14 +54,40 @@ const (
 	secretLen = 32
 )
 
-// config is the agent's identity, read once. It is never reloaded: when it
-// changes, the app restarts the agent over SSH. No file watching.
+// config is the agent's identity and rule set, read once. It is never
+// reloaded: when anything changes - a rule edit included - the app rewrites
+// this file and restarts the agent over SSH. No file watching.
 type config struct {
-	AgentID   string `json:"agent_id"`
-	Secret    string `json:"secret"`
-	IntervalS int    `json:"interval_s"`
-	Endpoint  string `json:"endpoint"`
+	AgentID        string       `json:"agent_id"`
+	Secret         string       `json:"secret"`
+	IntervalS      int          `json:"interval_s"`
+	Endpoint       string       `json:"endpoint"`
+	BreachEndpoint string       `json:"breach_endpoint"`
+	Rules          []ruleConfig `json:"rules"`
 }
+
+// ruleConfig is one alert rule as written by the app. rules may be absent or
+// empty, in which case the agent only beats.
+type ruleConfig struct {
+	RuleID    string  `json:"rule_id"`
+	Metric    string  `json:"metric"`
+	Threshold float64 `json:"threshold"`
+	DurationS int     `json:"duration_s"`
+	Label     string  `json:"label"`
+}
+
+var validMetrics = map[string]bool{
+	"cpu": true, "mem": true, "disk": true, "load": true, "net": true, "temp": true,
+}
+
+// labelRequired: disk needs a mount point, net an interface name. For every
+// other metric the label is carried but ignored.
+var labelRequired = map[string]bool{"disk": true, "net": true}
+
+// maxLabelBytes mirrors the backend's cap. Enforcing it here turns a
+// too-long label into a loud startup failure instead of a silent 400 on
+// every future breach report.
+const maxLabelBytes = 128
 
 func main() {
 	insecure := flag.Bool("insecure", false,
@@ -96,12 +128,64 @@ func main() {
 	interval := time.Duration(cfg.IntervalS) * time.Second
 
 	log.Info("sshush-agent starting",
-		"agent_id", cfg.AgentID, "endpoint", cfg.Endpoint, "interval", interval)
+		"agent_id", cfg.AgentID, "endpoint", cfg.Endpoint,
+		"interval", interval, "rules", len(cfg.Rules))
 
-	// First beat immediately rather than one interval from now: a restarted
-	// agent should announce itself at once. The backend's "heartbeat resumed"
-	// is only as prompt as the first beat after a restart.
-	beat(ctx, client, cfg.Endpoint, body, log)
+	// Rule machinery exists only when rules do; with none configured the
+	// agent only beats, exactly as before this slice.
+	var (
+		engine   *rules.Engine
+		reporter *report.Reporter
+		sample   rules.Sampler
+	)
+	if len(cfg.Rules) > 0 {
+		collector := metrics.New(log, runtime.NumCPU())
+		rs := make([]rules.Rule, 0, len(cfg.Rules))
+		hasTemp := false
+		for _, rc := range cfg.Rules {
+			if rc.Metric == "temp" {
+				hasTemp = true
+			}
+			rs = append(rs, rules.Rule{
+				ID:        rc.RuleID,
+				Metric:    rc.Metric,
+				Threshold: rc.Threshold,
+				Duration:  time.Duration(rc.DurationS) * time.Second,
+				Label:     rc.Label,
+			})
+		}
+		// Absent sensor is not an error, but a rule that will never evaluate
+		// deserves one loud line now rather than eternal silence.
+		if hasTemp && !collector.TempAvailable() {
+			log.Warn("a temp rule is configured but no thermal zone is readable; that rule will never evaluate")
+		}
+		engine = rules.New(rs, time.Now)
+		reporter = report.New(cfg.BreachEndpoint, cfg.AgentID, cfg.Secret, client, log)
+		sample = collector.Sample
+	}
+
+	// One tick: beat first - liveness must never wait behind metric reads -
+	// then evaluate rules, queue any transitions, and attempt delivery of
+	// everything undelivered (retries included).
+	tick := func() {
+		beat(ctx, client, cfg.Endpoint, body, log)
+		if engine != nil {
+			if events := engine.Evaluate(sample); len(events) > 0 {
+				for _, ev := range events {
+					log.Info("rule transition",
+						"rule_id", ev.Rule.ID, "metric", ev.Rule.Metric,
+						"direction", ev.Direction, "value", ev.Value)
+				}
+				reporter.Enqueue(events)
+			}
+			reporter.Flush(ctx)
+		}
+	}
+
+	// First tick immediately rather than one interval from now: a restarted
+	// agent should announce itself at once, and the first metric samples
+	// double as the baselines for the delta metrics.
+	tick()
 
 	for {
 		select {
@@ -110,11 +194,10 @@ func main() {
 			return
 		case <-time.After(jitter(interval)):
 		}
-		// The wait above starts only after the previous beat has returned
-		// (bounded by beatTimeout), so the interval is measured from last
-		// completion and "skip if still in flight" holds by construction -
-		// no bookkeeping required.
-		beat(ctx, client, cfg.Endpoint, body, log)
+		// The wait above starts only after the previous tick has returned
+		// (every network call in it is timeout-bounded), so the interval is
+		// measured from last completion and beats can never stack.
+		tick()
 	}
 }
 
@@ -174,22 +257,83 @@ func loadConfig(insecureOK bool) (config, error) {
 		return config{}, fmt.Errorf("%s: interval_s must be at least %d, got %d", configPath, minIntervalS, cfg.IntervalS)
 	}
 
-	u, err := url.Parse(cfg.Endpoint)
+	if err := checkEndpoint("endpoint", cfg.Endpoint, insecureOK); err != nil {
+		return config{}, err
+	}
+	// breach_endpoint is required only when there are rules to report on.
+	if len(cfg.Rules) > 0 || cfg.BreachEndpoint != "" {
+		if cfg.BreachEndpoint == "" {
+			return config{}, fmt.Errorf("%s: rules are configured but breach_endpoint is missing", configPath)
+		}
+		if err := checkEndpoint("breach_endpoint", cfg.BreachEndpoint, insecureOK); err != nil {
+			return config{}, err
+		}
+	}
+
+	if problems := validateRules(cfg.Rules); len(problems) > 0 {
+		// Any invalid rule stops the agent outright - no starting with
+		// partial rules. The app is mid-restart over SSH when this fires
+		// and needs a failure it can attribute to the exact rule.
+		return config{}, fmt.Errorf("%s: invalid rules:\n  - %s", configPath, strings.Join(problems, "\n  - "))
+	}
+
+	return cfg, nil
+}
+
+func checkEndpoint(name, raw string, insecureOK bool) error {
+	u, err := url.Parse(raw)
 	if err != nil || u.Host == "" {
-		return config{}, fmt.Errorf("%s: endpoint is not a valid url", configPath)
+		return fmt.Errorf("%s: %s is not a valid url", configPath, name)
 	}
 	switch u.Scheme {
 	case "https":
 		// The only acceptable production transport.
+		return nil
 	case "http":
 		if !insecureOK {
-			return config{}, fmt.Errorf("%s: endpoint is plain http, which would send the secret unencrypted; use https, or pass --insecure to accept that on a test network", configPath)
+			return fmt.Errorf("%s: %s is plain http, which would send the secret unencrypted; use https, or pass --insecure to accept that on a test network", configPath, name)
 		}
+		return nil
 	default:
-		return config{}, fmt.Errorf("%s: endpoint scheme must be https (or http with --insecure)", configPath)
+		return fmt.Errorf("%s: %s scheme must be https (or http with --insecure)", configPath, name)
 	}
+}
 
-	return cfg, nil
+// validateRules checks every rule and reports every problem at once, each
+// attributable to its rule by index and id.
+func validateRules(rs []ruleConfig) []string {
+	var problems []string
+	bad := func(i int, r ruleConfig, msg string) {
+		problems = append(problems, fmt.Sprintf("rules[%d] (rule_id %q): %s", i, r.RuleID, msg))
+	}
+	seen := make(map[string]bool)
+	for i, r := range rs {
+		if !validUUID(r.RuleID) {
+			bad(i, r, "rule_id is not a canonical hyphenated uuid")
+		} else if seen[r.RuleID] {
+			// Two rules sharing an id would fight over one backend state
+			// row, flapping it forever.
+			bad(i, r, "duplicate rule_id")
+		} else {
+			seen[r.RuleID] = true
+		}
+		if !validMetrics[r.Metric] {
+			bad(i, r, fmt.Sprintf("metric %q is not one of cpu|mem|disk|load|net|temp", r.Metric))
+		}
+		if math.IsNaN(r.Threshold) || math.IsInf(r.Threshold, 0) {
+			bad(i, r, "threshold is not a finite number")
+		}
+		if r.DurationS < 0 {
+			bad(i, r, fmt.Sprintf("duration_s must be >= 0, got %d", r.DurationS))
+		}
+		if labelRequired[r.Metric] && r.Label == "" {
+			bad(i, r, fmt.Sprintf("label is required for metric %q (mount point or interface name)", r.Metric))
+		}
+		if len(r.Label) > maxLabelBytes {
+			bad(i, r, fmt.Sprintf("label is %d bytes, max %d", len(r.Label), maxLabelBytes))
+		}
+	}
+	return problems
 }
 
 // validUUID accepts the canonical 8-4-4-4-12 hyphenated form only, matching
