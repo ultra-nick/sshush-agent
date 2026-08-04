@@ -18,7 +18,11 @@ import (
 	"time"
 )
 
-const heartbeatInterval = 60 * time.Second
+// Deliberately not called a heartbeat. This only writes a line to the journal;
+// there is no protocol, no peer, and nothing goes over the wire. The heartbeat
+// is a separate piece of work that does not exist yet, and reusing the word here
+// would make later readers think it had already been built and tested.
+const livenessLogInterval = 60 * time.Second
 
 func main() {
 	// systemd stamps its own timestamp and unit name onto every journal line,
@@ -33,7 +37,7 @@ func main() {
 	// waiting a full interval for the first line.
 	log.Print("sshush-agent alive")
 
-	ticker := time.NewTicker(heartbeatInterval)
+	ticker := time.NewTicker(livenessLogInterval)
 	defer ticker.Stop()
 
 	for {
