@@ -1,0 +1,13 @@
+[Unit]
+Description=Watch for the SSHush uninstall marker
+
+[Path]
+# Triggers sshush-uninstall.service (matched by unit name, so no Unit= needed).
+#
+# The marker's contents are never read. It carries exactly one bit of meaning:
+# the sshush user asked to be uninstalled. /var/lib/sshush is the agent's only
+# writable path, which is what lets an unprivileged agent request this.
+PathExists=/var/lib/sshush/uninstall
+
+[Install]
+WantedBy=multi-user.target

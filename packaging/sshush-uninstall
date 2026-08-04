@@ -1,0 +1,86 @@
+#!/bin/sh
+#
+# Removes SSHush from this server.
+#
+# Runs as root, either from sshush-uninstall.service (triggered by
+# sshush-uninstall.path when /var/lib/sshush/uninstall appears) or invoked
+# directly by an administrator. Both routes must work.
+#
+# SECURITY: every path below is a hardcoded absolute literal. Nothing is read
+# out of the marker file, and no path, name, or argument is derived from it, from
+# the environment, or from any argument passed to this script. The marker carries
+# exactly one bit of meaning - "the sshush user asked" - so an attacker who fully
+# controls the agent can do nothing worse than uninstall it. If you are editing
+# this script, that property is a requirement, not a stylistic preference.
+#
+# There is deliberately no `set -e`. Every step has to tolerate its target
+# already being gone, so that a partially-completed previous run can be finished
+# simply by running this again.
+
+step() {
+	echo "sshush-uninstall: $*"
+}
+
+if [ "$(id -u)" -ne 0 ]; then
+	echo "sshush-uninstall: must run as root (try: sudo /usr/local/bin/sshush-uninstall)" >&2
+	exit 1
+fi
+
+step "removing SSHush"
+
+# 1. The watcher goes first, so that a marker surviving anything below cannot
+#    re-trigger this script.
+step "1/9 disabling the uninstall watcher"
+systemctl stop sshush-uninstall.path >/dev/null 2>&1 || :
+systemctl disable sshush-uninstall.path >/dev/null 2>&1 || :
+
+step "2/9 stopping and disabling the agent"
+systemctl stop sshush-agent.service >/dev/null 2>&1 || :
+systemctl disable sshush-agent.service >/dev/null 2>&1 || :
+
+step "3/9 removing the agent and watcher unit files"
+rm -f /etc/systemd/system/sshush-agent.service
+rm -f /etc/systemd/system/sshush-uninstall.path
+
+step "4/9 removing configuration and state"
+rm -rf /etc/sshush
+rm -rf /var/lib/sshush
+
+step "5/9 removing the agent binary"
+rm -f /usr/local/bin/sshush-agent
+
+step "6/9 removing the sshush user and group"
+if id -u sshush >/dev/null 2>&1; then
+	userdel sshush >/dev/null 2>&1 ||
+		echo "sshush-uninstall: userdel failed; remove the sshush user by hand" >&2
+else
+	step "      sshush user already absent"
+fi
+# install.sh creates the group explicitly, so remove it explicitly. userdel only
+# reaps the primary group on some distros. Fails harmlessly if it is already gone
+# or still has members.
+groupdel sshush >/dev/null 2>&1 || :
+
+# 7. This is the unit file for the service currently executing. systemd has
+#    already loaded it; removing it now is safe.
+step "7/9 removing the uninstall unit file (the one running this)"
+rm -f /etc/systemd/system/sshush-uninstall.service
+
+step "8/9 reloading systemd"
+systemctl daemon-reload >/dev/null 2>&1 || :
+# Without this, removed units can linger in `systemctl --failed`.
+systemctl reset-failed sshush-agent.service sshush-uninstall.service sshush-uninstall.path >/dev/null 2>&1 || :
+
+step "9/9 removing this script"
+step "done - SSHush has been removed"
+
+# LAST LINE. Self-deletion: /bin/sh reads this script through an open file
+# descriptor, and unlinking a file whose fd is still open leaves the inode alive
+# on Linux, so the running shell is unaffected. Nothing may follow this.
+#
+# The `|| :` is not about tolerating a missing file - rm -f already returns 0 for
+# that. It is because this is the last command, so its status becomes the script's
+# exit status, and a non-zero one (a read-only /usr mount, say) would leave
+# sshush-uninstall.service sitting in `systemctl --failed` after a removal that
+# otherwise succeeded.
+rm -f /usr/local/bin/sshush-uninstall || :

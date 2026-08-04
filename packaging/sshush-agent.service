@@ -1,0 +1,28 @@
+[Unit]
+Description=SSHush agent
+Documentation=https://github.com/ultra-nick/sshush-agent
+
+[Service]
+Type=simple
+User=sshush
+Group=sshush
+ExecStart=/usr/local/bin/sshush-agent
+
+# A clean exit 0 must leave the service stopped, not restart it. Only a crash
+# or a non-zero exit brings it back.
+Restart=on-failure
+RestartSec=10
+
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+
+# ProtectSystem=strict makes the whole filesystem read-only, so this is the one
+# writable location the agent gets. /etc/sshush stays read-only to it by design.
+# Deliberately not StateDirectory=: install.sh creates /var/lib/sshush and
+# sshush-uninstall removes it, and StateDirectory= complicates both.
+ReadWritePaths=/var/lib/sshush
+
+[Install]
+WantedBy=multi-user.target

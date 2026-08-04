@@ -1,0 +1,9 @@
+[Unit]
+Description=Remove SSHush from this server
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/sshush-uninstall
+
+# No [Install] section: this unit is only ever started by sshush-uninstall.path,
+# never enabled directly.
