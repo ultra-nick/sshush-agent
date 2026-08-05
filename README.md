@@ -5,35 +5,57 @@ The server-side agent for [SSHush](https://sshush.app), an iOS app for monitorin
 This repository is public so you can read every line that runs on your server before you install
 it. That is the point of it being here.
 
-## Status: early
+## What it does
 
-The agent currently does exactly one thing: it sends a **heartbeat**. Every interval it POSTs
-its identity (`agent_id` plus a secret) to the configured backend endpoint, and it ignores
-every response and every error - no retry, no backoff, no reaction to any status code. The
-backend infers presence from beats arriving and absence from beats stopping.
+The agent does four things, and nothing else:
 
-That is its **only** network activity: one outbound HTTPS POST, to one endpoint you can read
-in `/etc/sshush/config.json`. It does **not** yet collect metrics, and it never listens on any
-port, executes remote commands, or fetches anything. Those boundaries are the point of the
-design; the metrics collection that comes later will widen what the beat carries, not what the
-agent accepts.
+1. **Heartbeat.** Every `interval_s` it POSTs its identity (`agent_id` plus a secret) to
+   `endpoint`, then ignores every response and every error - no retry, no backoff, no reaction
+   to any status code. The backend infers presence from beats arriving and absence from beats
+   stopping.
+2. **Metrics.** It samples local metrics from `/proc` and `/sys`: CPU, memory, disk, load,
+   network, and temperature.
+3. **Rules.** It evaluates threshold rules against those samples, on the server. A rule breaches
+   only after the value has stayed past its threshold for the rule's full duration, and clears on
+   a single sample back the other side - slow to alarm, fast to reassure.
+4. **Breach reports.** When a rule changes state, it POSTs that one transition to
+   `breach_endpoint`.
 
-The identity file at `/etc/sshush/config.json` (root-owned, group-readable, mode `0640`) is
-read once at startup and never watched or reloaded:
+Metrics are read and rules are evaluated entirely on the server; only a crossed threshold is ever
+sent, never the underlying numbers. Beyond those outbound POSTs the agent **never listens on any
+port, executes a remote command, or fetches anything** - its whole network footprint is the two
+endpoints you can read in `/etc/sshush/config.json`. An agent with no rules configured simply
+beats; metrics sampling and breach reporting switch on only when rules are present.
+
+The identity and rules file at `/etc/sshush/config.json` (root-owned, group-readable, mode
+`0640`) is read once at startup and never watched or reloaded:
 
 ```json
 {
-  "agent_id":   "<uuid>",
-  "secret":     "<base64url, 32 bytes>",
-  "interval_s": 60,
-  "endpoint":   "https://example.com/v1/beat"
+  "agent_id":        "<uuid>",
+  "secret":          "<base64url, 32 bytes>",
+  "interval_s":      60,
+  "endpoint":        "https://example.com/v1/beat",
+  "breach_endpoint": "https://example.com/v1/breach",
+  "rules": [
+    {
+      "rule_id":    "<uuid>",
+      "metric":     "disk",
+      "threshold":  90,
+      "duration_s": 300,
+      "label":      "/"
+    }
+  ]
 }
 ```
 
-The endpoint must be `https://`. The agent refuses to start with a plain-http endpoint unless
-`--insecure` is passed explicitly, because the secret would cross the network unencrypted -
-that is a choice a test environment can make on purpose, not a default anyone can ship by
-accident.
+`rules` may be empty or omitted, in which case the agent only beats and `breach_endpoint` is not
+needed. Valid metrics are `cpu`, `mem`, `disk`, `load`, `net`, and `temp`; `disk` and `net` take a
+`label` (a mount point or an interface name).
+
+Both endpoints must be `https://`. The agent refuses to start with a plain-http endpoint unless
+`--insecure` is passed explicitly, because the secret would cross the network unencrypted - that
+is a choice a test environment can make on purpose, not a default anyone can ship by accident.
 
 Still worth reviewing first: how the agent is installed, what privileges it runs with, and how
 it is removed.
