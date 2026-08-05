@@ -10,3 +10,6 @@ packaging/sshush-agent
 
 # macOS
 .DS_Store
+
+# Development notes for coding-assistant sessions - not part of the public repo.
+CLAUDE.md
