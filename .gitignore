@@ -13,3 +13,7 @@ packaging/sshush-agent
 
 # Development notes for coding-assistant sessions - not part of the public repo.
 CLAUDE.md
+
+# Unit tests - kept local, not shipped in the public repo (nothing here runs
+# on a user server; the built binary does). go build ignores these anyway.
+*_test.go
