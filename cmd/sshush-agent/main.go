@@ -70,6 +70,13 @@ const (
 	// rules.json falls back to this rather than stopping.
 	defaultIntervalS = 60
 
+	// unreachable_after_s bounds. It is the single number the app computes and
+	// the agent relays to the backend on every beat: how long of silence
+	// should count as down. The agent never interprets it, only carries it.
+	minUnreachableS     = 60
+	maxUnreachableS     = 3600
+	defaultUnreachableS = 180
+
 	// sampleInterval is the FIXED metric-sampling, rule-evaluation, and
 	// rules-file-stat rate, independent of the beat interval and deliberately
 	// not configurable. At 10s the shortest offered duration (60s) is six
@@ -92,11 +99,24 @@ type identity struct {
 }
 
 // rulesFileJSON is the settings file (/var/lib/sshush/rules.json), user-owned
-// and re-read on change. interval_s lives here, not in the identity, so a
-// password-sudo user can change the unreachable timing without root.
+// and re-read on change. interval_s and unreachable_after_s live here, not in
+// the identity, so a password-sudo user can change the timing without root.
+//
+// unreachable_after_s is a pointer so an absent field (nil -> defaulted with a
+// warning) is distinguishable from a present-but-out-of-range value (which
+// keeps the previous settings, like any malformed field).
 type rulesFileJSON struct {
-	IntervalS int          `json:"interval_s"`
-	Rules     []ruleConfig `json:"rules"`
+	IntervalS         int          `json:"interval_s"`
+	UnreachableAfterS *int         `json:"unreachable_after_s"`
+	Rules             []ruleConfig `json:"rules"`
+}
+
+// ruleSettings is one successfully loaded settings file.
+type ruleSettings struct {
+	intervalS            int
+	unreachableAfterS    int
+	rules                []rules.Rule
+	unreachableDefaulted bool // the field was absent and fell back to the default
 }
 
 // ruleConfig is one alert rule as written by the app. rules may be absent or
@@ -147,28 +167,19 @@ func main() {
 			"endpoint", id.Endpoint)
 	}
 
-	// The body never changes, so it is built exactly once. This is the only
-	// place the secret leaves the process, and it leaves only toward the
-	// endpoint - never toward a log, on any path.
-	body, err := json.Marshal(map[string]string{
-		"agent_id": id.AgentID,
-		"secret":   id.Secret,
-	})
-	if err != nil {
-		log.Error("building beat body failed", "error", err.Error())
-		os.Exit(1)
-	}
-
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
 	client := &http.Client{Timeout: beatTimeout}
 
-	// The beat interval lives in shared atomic state because a rules-file
-	// reload on the sample goroutine can change it, and the beat goroutine
-	// reads the new value on its next tick - no restart. Held as nanoseconds.
+	// The beat interval and the reported unreachable_after_s both live in
+	// shared atomic state because a rules-file reload on the sample goroutine
+	// changes them, and the beat goroutine reads the current values on its next
+	// tick - no restart. interval in nanoseconds, unreachable in seconds.
 	var intervalNanos atomic.Int64
 	intervalNanos.Store(int64(defaultIntervalS) * int64(time.Second))
+	var unreachableS atomic.Int64
+	unreachableS.Store(int64(defaultUnreachableS))
 
 	// The engine and reporter exist even when there are no rules yet: rules can
 	// APPEAR at runtime when the settings file is written, so the sample loop
@@ -184,13 +195,15 @@ func main() {
 	sample := collector.Sample
 
 	watcher := &ruleWatcher{
-		path: rulesPath, log: log, engine: engine, collector: collector, interval: &intervalNanos,
+		path: rulesPath, log: log, engine: engine, collector: collector,
+		interval: &intervalNanos, unreachable: &unreachableS,
 	}
 	watcher.check(true) // startup load: applies rules.json if present, else no rules
 
 	log.Info("sshush-agent starting",
 		"agent_id", id.AgentID, "endpoint", id.Endpoint,
-		"interval", time.Duration(intervalNanos.Load()))
+		"interval", time.Duration(intervalNanos.Load()),
+		"unreachable_after_s", unreachableS.Load())
 
 	// Two independent timers that share no timing. The beat reads the current
 	// interval each tick; the sample loop re-reads the rules file and evaluates.
@@ -204,7 +217,10 @@ func main() {
 		runTickLoop(ctx, func() time.Duration {
 			return jitter(time.Duration(intervalNanos.Load()))
 		}, func() {
-			beat(ctx, client, id.Endpoint, body, log)
+			// The body is rebuilt each beat so it carries the CURRENT
+			// unreachable_after_s, which a reload may have changed.
+			beat(ctx, client, id.Endpoint,
+				buildBeatBody(id.AgentID, id.Secret, unreachableS.Load()), log)
 		})
 	}()
 
@@ -231,11 +247,12 @@ func main() {
 // the sample goroutine (and once from main at startup, before that goroutine
 // starts), except interval, which is atomic and shared with the beat loop.
 type ruleWatcher struct {
-	path      string
-	log       *slog.Logger
-	engine    *rules.Engine
-	collector *metrics.Collector
-	interval  *atomic.Int64 // nanoseconds, read by the beat loop
+	path        string
+	log         *slog.Logger
+	engine      *rules.Engine
+	collector   *metrics.Collector
+	interval    *atomic.Int64 // nanoseconds, read by the beat loop
+	unreachable *atomic.Int64 // seconds, read by the beat loop and reported on every beat
 
 	lastMtime time.Time
 	present   bool
@@ -272,7 +289,7 @@ func (w *ruleWatcher) check(startup bool) {
 	w.present = true
 	w.lastMtime = info.ModTime()
 
-	interval, rs, perr := loadRulesFile(w.path)
+	s, perr := loadRulesFile(w.path)
 	if perr != nil {
 		if startup {
 			w.log.Warn("rules file could not be loaded; starting with no rules", "error", perr.Error())
@@ -282,13 +299,20 @@ func (w *ruleWatcher) check(startup bool) {
 		return
 	}
 
-	w.interval.Store(int64(time.Duration(interval) * time.Second))
-	w.engine.UpdateRules(rs)
-	w.warnUnevaluable(rs)
+	w.interval.Store(int64(time.Duration(s.intervalS) * time.Second))
+	w.unreachable.Store(int64(s.unreachableAfterS))
+	w.engine.UpdateRules(s.rules)
+	w.warnUnevaluable(s.rules)
+	if s.unreachableDefaulted {
+		w.log.Warn("rules file has no unreachable_after_s; using the default",
+			"default_s", defaultUnreachableS)
+	}
 	if startup {
-		w.log.Info("rules loaded", "rules", len(rs), "interval_s", interval)
+		w.log.Info("rules loaded", "rules", len(s.rules),
+			"interval_s", s.intervalS, "unreachable_after_s", s.unreachableAfterS)
 	} else {
-		w.log.Info("rules reloaded", "rules", len(rs), "interval_s", interval)
+		w.log.Info("rules reloaded", "rules", len(s.rules),
+			"interval_s", s.intervalS, "unreachable_after_s", s.unreachableAfterS)
 	}
 }
 
@@ -358,6 +382,25 @@ func evaluateAndReport(ctx context.Context, engine *rules.Engine, sample rules.S
 	reporter.Flush(ctx)
 }
 
+// beatBody is the heartbeat payload. unreachable_after_s rides every beat so
+// the backend always has the current threshold from the most recent beat -
+// there is no separately stored value to fall out of step. interval_s is NOT
+// reported: the backend does not care how often beats arrive, only how long of
+// silence counts.
+type beatBody struct {
+	AgentID           string `json:"agent_id"`
+	Secret            string `json:"secret"`
+	UnreachableAfterS int64  `json:"unreachable_after_s"`
+}
+
+// buildBeatBody marshals one beat payload. Kept separate so the payload shape
+// is unit-testable without a network. The secret is a value here and goes only
+// toward the endpoint - never toward a log, on any path.
+func buildBeatBody(agentID, secret string, unreachableS int64) []byte {
+	b, _ := json.Marshal(beatBody{AgentID: agentID, Secret: secret, UnreachableAfterS: unreachableS})
+	return b
+}
+
 // beat sends one heartbeat and deliberately discards the outcome.
 //
 // The status code is logged at debug and acted on by no one. The request
@@ -424,27 +467,42 @@ func loadIdentity(insecureOK bool) (identity, error) {
 	return id, nil
 }
 
-// loadRulesFile reads, parses and validates the settings file, returning the
-// interval and the rule set. Any error - missing file, bad JSON, out-of-range
-// interval, an invalid rule - is returned for the caller to handle by keeping
-// whatever is already in force. Nothing here is fatal.
-func loadRulesFile(path string) (intervalS int, rs []rules.Rule, err error) {
+// loadRulesFile reads, parses and validates the settings file. Any error -
+// missing file, bad JSON, out-of-range interval or unreachable, an invalid
+// rule - is returned for the caller to handle by keeping whatever is already
+// in force. Nothing here is fatal.
+//
+// A missing unreachable_after_s is NOT an error: it defaults to
+// defaultUnreachableS and the returned settings flag it so the caller can warn.
+// A present but out-of-range value IS an error, like any malformed field.
+func loadRulesFile(path string) (ruleSettings, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
-		return 0, nil, err
+		return ruleSettings{}, err
 	}
 	var rf rulesFileJSON
 	if err := json.Unmarshal(raw, &rf); err != nil {
-		return 0, nil, fmt.Errorf("parse %s: %w", path, err)
+		return ruleSettings{}, fmt.Errorf("parse %s: %w", path, err)
 	}
 	if rf.IntervalS < minIntervalS {
-		// An out-of-range interval is rejected the same way a parse failure
-		// is: the previous value is kept. The floor keeps the request timeout
-		// well under every interval, so beats can never stack.
-		return 0, nil, fmt.Errorf("%s: interval_s must be at least %d, got %d", path, minIntervalS, rf.IntervalS)
+		// The floor keeps the request timeout well under every interval, so
+		// beats can never stack. Out of range keeps the previous value.
+		return ruleSettings{}, fmt.Errorf("%s: interval_s must be at least %d, got %d", path, minIntervalS, rf.IntervalS)
 	}
+
+	unreachable := defaultUnreachableS
+	defaulted := false
+	if rf.UnreachableAfterS == nil {
+		defaulted = true
+	} else if *rf.UnreachableAfterS < minUnreachableS || *rf.UnreachableAfterS > maxUnreachableS {
+		return ruleSettings{}, fmt.Errorf("%s: unreachable_after_s must be between %d and %d, got %d",
+			path, minUnreachableS, maxUnreachableS, *rf.UnreachableAfterS)
+	} else {
+		unreachable = *rf.UnreachableAfterS
+	}
+
 	if problems := validateRules(rf.Rules); len(problems) > 0 {
-		return 0, nil, fmt.Errorf("%s: invalid rules:\n  - %s", path, strings.Join(problems, "\n  - "))
+		return ruleSettings{}, fmt.Errorf("%s: invalid rules:\n  - %s", path, strings.Join(problems, "\n  - "))
 	}
 	out := make([]rules.Rule, 0, len(rf.Rules))
 	for _, rc := range rf.Rules {
@@ -456,7 +514,12 @@ func loadRulesFile(path string) (intervalS int, rs []rules.Rule, err error) {
 			Label:     rc.Label,
 		})
 	}
-	return rf.IntervalS, out, nil
+	return ruleSettings{
+		intervalS:            rf.IntervalS,
+		unreachableAfterS:    unreachable,
+		rules:                out,
+		unreachableDefaulted: defaulted,
+	}, nil
 }
 
 func checkEndpoint(name, raw string, insecureOK bool) error {

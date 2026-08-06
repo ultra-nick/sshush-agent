@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/json"
 	"io"
 	"log/slog"
 	"os"
@@ -22,20 +23,25 @@ const (
 	  {"rule_id":"00000000-0000-4000-8000-00000000000c","metric":"mem","threshold":90,"duration_s":60,"label":""}]}`
 )
 
+// Returns the watcher (its .unreachable atomic is reachable via the field for
+// the tests that check it), a log buffer, the interval atomic, and the engine.
 func newTestWatcher(t *testing.T, path string) (*ruleWatcher, *bytes.Buffer, *atomic.Int64, *rules.Engine) {
 	t.Helper()
-	var iv atomic.Int64
+	iv := new(atomic.Int64)
 	iv.Store(int64(defaultIntervalS) * int64(time.Second))
+	unr := new(atomic.Int64)
+	unr.Store(int64(defaultUnreachableS))
 	eng := rules.New(nil, time.Now)
 	var buf bytes.Buffer
 	w := &ruleWatcher{
-		path:      path,
-		log:       slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})),
-		engine:    eng,
-		collector: metrics.New(slog.New(slog.NewTextHandler(io.Discard, nil)), 4),
-		interval:  &iv,
+		path:        path,
+		log:         slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelWarn})),
+		engine:      eng,
+		collector:   metrics.New(slog.New(slog.NewTextHandler(io.Discard, nil)), 4),
+		interval:    iv,
+		unreachable: unr,
 	}
-	return w, &buf, &iv, eng
+	return w, &buf, iv, eng
 }
 
 func writeFileMtime(t *testing.T, path, content string, mtime time.Time) {
@@ -195,34 +201,112 @@ func TestLoadRulesFile(t *testing.T) {
 		return p
 	}
 
-	t.Run("valid", func(t *testing.T) {
-		interval, rs, err := loadRulesFile(write("ok.json", oneRule))
+	t.Run("valid with unreachable", func(t *testing.T) {
+		s, err := loadRulesFile(write("ok.json", `{"interval_s":45,"unreachable_after_s":300,"rules":[]}`))
 		if err != nil {
 			t.Fatal(err)
 		}
-		if interval != 45 || len(rs) != 1 || rs[0].Duration != 300*time.Second {
-			t.Errorf("parsed = interval %d, %d rules, dur %v", interval, len(rs), rs[0].Duration)
+		if s.intervalS != 45 || s.unreachableAfterS != 300 || s.unreachableDefaulted {
+			t.Errorf("parsed = %+v", s)
+		}
+	})
+	t.Run("missing unreachable defaults with flag", func(t *testing.T) {
+		s, err := loadRulesFile(write("noun.json", oneRule)) // oneRule has no unreachable field
+		if err != nil {
+			t.Fatal(err)
+		}
+		if s.unreachableAfterS != defaultUnreachableS || !s.unreachableDefaulted {
+			t.Errorf("missing unreachable = %d, defaulted %v; want %d, true", s.unreachableAfterS, s.unreachableDefaulted, defaultUnreachableS)
+		}
+	})
+	t.Run("unreachable below 60 rejected", func(t *testing.T) {
+		if _, err := loadRulesFile(write("low_u.json", `{"interval_s":60,"unreachable_after_s":59,"rules":[]}`)); err == nil {
+			t.Error("unreachable 59 accepted")
+		}
+	})
+	t.Run("unreachable above 3600 rejected", func(t *testing.T) {
+		if _, err := loadRulesFile(write("high_u.json", `{"interval_s":60,"unreachable_after_s":3601,"rules":[]}`)); err == nil {
+			t.Error("unreachable 3601 accepted")
 		}
 	})
 	t.Run("interval below 30", func(t *testing.T) {
-		if _, _, err := loadRulesFile(write("low.json", `{"interval_s":29,"rules":[]}`)); err == nil {
+		if _, err := loadRulesFile(write("low.json", `{"interval_s":29,"rules":[]}`)); err == nil {
 			t.Error("interval 29 accepted")
 		}
 	})
 	t.Run("malformed json", func(t *testing.T) {
-		if _, _, err := loadRulesFile(write("bad.json", `{"interval_s":`)); err == nil {
+		if _, err := loadRulesFile(write("bad.json", `{"interval_s":`)); err == nil {
 			t.Error("malformed json accepted")
 		}
 	})
 	t.Run("invalid rule", func(t *testing.T) {
 		bad := `{"interval_s":60,"rules":[{"rule_id":"6ba7b810-9dad-11d1-80b4-00c04fd430c8","metric":"uptime","threshold":1,"duration_s":0,"label":""}]}`
-		if _, _, err := loadRulesFile(write("badrule.json", bad)); err == nil {
+		if _, err := loadRulesFile(write("badrule.json", bad)); err == nil {
 			t.Error("invalid metric accepted")
 		}
 	})
 	t.Run("missing file", func(t *testing.T) {
-		if _, _, err := loadRulesFile(filepath.Join(dir, "nope.json")); err == nil {
+		if _, err := loadRulesFile(filepath.Join(dir, "nope.json")); err == nil {
 			t.Error("missing file accepted")
 		}
 	})
+}
+
+// buildBeatBody must carry unreachable_after_s on every beat, and the current
+// value from the atomic - not interval_s.
+func TestBuildBeatBody(t *testing.T) {
+	body := buildBeatBody("6ba7b810-9dad-11d1-80b4-00c04fd430c8", "sekret", 240)
+	var got map[string]any
+	if err := json.Unmarshal(body, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got["agent_id"] != "6ba7b810-9dad-11d1-80b4-00c04fd430c8" || got["secret"] != "sekret" {
+		t.Errorf("identity fields wrong: %v", got)
+	}
+	if got["unreachable_after_s"].(float64) != 240 {
+		t.Errorf("unreachable_after_s = %v, want 240", got["unreachable_after_s"])
+	}
+	if _, present := got["interval_s"]; present {
+		t.Error("interval_s must NOT be in the beat body")
+	}
+}
+
+// unreachable_after_s and interval_s change independently on reload, and both
+// atomics reflect the new file.
+func TestWatcherUpdatesUnreachableIndependently(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rules.json")
+	writeFileMtime(t, path, `{"interval_s":60,"unreachable_after_s":180,"rules":[]}`, time.Unix(1000, 0))
+	w, _, iv, _ := newTestWatcher(t, path)
+	w.check(true)
+	if iv.Load() != nanos(60) || w.unreachable.Load() != 180 {
+		t.Fatalf("startup: interval %d, unreachable %d", iv.Load(), w.unreachable.Load())
+	}
+
+	// Change ONLY unreachable_after_s.
+	writeFileMtime(t, path, `{"interval_s":60,"unreachable_after_s":600,"rules":[]}`, time.Unix(2000, 0))
+	w.check(false)
+	if iv.Load() != nanos(60) || w.unreachable.Load() != 600 {
+		t.Errorf("after unreachable change: interval %d (want 60s), unreachable %d (want 600)", iv.Load(), w.unreachable.Load())
+	}
+
+	// Change ONLY interval_s.
+	writeFileMtime(t, path, `{"interval_s":120,"unreachable_after_s":600,"rules":[]}`, time.Unix(3000, 0))
+	w.check(false)
+	if iv.Load() != nanos(120) || w.unreachable.Load() != 600 {
+		t.Errorf("after interval change: interval %d (want 120s), unreachable %d (want 600)", iv.Load(), w.unreachable.Load())
+	}
+}
+
+// An out-of-range unreachable_after_s keeps the previous value (and rules).
+func TestWatcherUnreachableOutOfRangeKeepsPrevious(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rules.json")
+	writeFileMtime(t, path, `{"interval_s":60,"unreachable_after_s":300,"rules":[]}`, time.Unix(1000, 0))
+	w, _, _, _ := newTestWatcher(t, path)
+	w.check(true)
+
+	writeFileMtime(t, path, `{"interval_s":60,"unreachable_after_s":10,"rules":[]}`, time.Unix(2000, 0))
+	w.check(false)
+	if w.unreachable.Load() != 300 {
+		t.Errorf("out-of-range unreachable applied: %d, want 300 kept", w.unreachable.Load())
+	}
 }
