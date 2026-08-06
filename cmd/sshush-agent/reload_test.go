@@ -252,10 +252,10 @@ func TestLoadRulesFile(t *testing.T) {
 	})
 }
 
-// buildBeatBody must carry unreachable_after_s on every beat, and the current
-// value from the atomic - not interval_s.
+// buildBeatBody must carry unreachable_after_s and uptime_s on every beat,
+// with the current values - not interval_s.
 func TestBuildBeatBody(t *testing.T) {
-	body := buildBeatBody("6ba7b810-9dad-11d1-80b4-00c04fd430c8", "sekret", 240)
+	body := buildBeatBody("6ba7b810-9dad-11d1-80b4-00c04fd430c8", "sekret", 240, 17)
 	var got map[string]any
 	if err := json.Unmarshal(body, &got); err != nil {
 		t.Fatal(err)
@@ -265,6 +265,9 @@ func TestBuildBeatBody(t *testing.T) {
 	}
 	if got["unreachable_after_s"].(float64) != 240 {
 		t.Errorf("unreachable_after_s = %v, want 240", got["unreachable_after_s"])
+	}
+	if got["uptime_s"].(float64) != 17 {
+		t.Errorf("uptime_s = %v, want 17", got["uptime_s"])
 	}
 	if _, present := got["interval_s"]; present {
 		t.Error("interval_s must NOT be in the beat body")

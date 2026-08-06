@@ -224,6 +224,12 @@ func main() {
 
 	// Beat: immediate first (announce on restart at once), then every current
 	// interval jittered +-10%, measured from last completion.
+	//
+	// procStart anchors uptime_s: seconds since THIS process began, so the
+	// backend can spot a crash loop (see beatBody.UptimeS). Process start, not
+	// host boot - a rebooting host is the host's business; a restarting process
+	// is ours.
+	procStart := time.Now()
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -231,9 +237,10 @@ func main() {
 			return jitter(time.Duration(intervalNanos.Load()))
 		}, func() {
 			// The body is rebuilt each beat so it carries the CURRENT
-			// unreachable_after_s, which a reload may have changed.
+			// unreachable_after_s (a reload may have changed it) and uptime.
 			beat(ctx, client, id.Endpoint,
-				buildBeatBody(id.AgentID, id.Secret, unreachableS.Load()), log)
+				buildBeatBody(id.AgentID, id.Secret, unreachableS.Load(),
+					int64(time.Since(procStart).Seconds())), log)
 		})
 	}()
 
@@ -417,13 +424,23 @@ type beatBody struct {
 	AgentID           string `json:"agent_id"`
 	Secret            string `json:"secret"`
 	UnreachableAfterS int64  `json:"unreachable_after_s"`
+	// UptimeS is how long this PROCESS has been alive, in whole seconds. The
+	// backend uses it to spot a crash-looping agent: a process that keeps
+	// dying and restarting beats on time (systemd brings it back), so liveness
+	// alone can never see the problem - but every one of its beats reports a
+	// young uptime, and a run of those is the fingerprint. Additive and
+	// optional: an old backend ignores it.
+	UptimeS int64 `json:"uptime_s"`
 }
 
 // buildBeatBody marshals one beat payload. Kept separate so the payload shape
 // is unit-testable without a network. The secret is a value here and goes only
 // toward the endpoint - never toward a log, on any path.
-func buildBeatBody(agentID, secret string, unreachableS int64) []byte {
-	b, _ := json.Marshal(beatBody{AgentID: agentID, Secret: secret, UnreachableAfterS: unreachableS})
+func buildBeatBody(agentID, secret string, unreachableS, uptimeS int64) []byte {
+	b, _ := json.Marshal(beatBody{
+		AgentID: agentID, Secret: secret,
+		UnreachableAfterS: unreachableS, UptimeS: uptimeS,
+	})
 	return b
 }
 
