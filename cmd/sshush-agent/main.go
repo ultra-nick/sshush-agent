@@ -106,15 +106,18 @@ type identity struct {
 // warning) is distinguishable from a present-but-out-of-range value (which
 // keeps the previous settings, like any malformed field).
 type rulesFileJSON struct {
-	IntervalS         int          `json:"interval_s"`
-	UnreachableAfterS *int         `json:"unreachable_after_s"`
-	Rules             []ruleConfig `json:"rules"`
+	IntervalS         int             `json:"interval_s"`
+	UnreachableAfterS *int            `json:"unreachable_after_s"`
+	DeviceToken       json.RawMessage `json:"device_token"`
+	Rules             []ruleConfig    `json:"rules"`
 }
 
 // ruleSettings is one successfully loaded settings file.
 type ruleSettings struct {
 	intervalS            int
 	unreachableAfterS    int
+	tokenIntent          tokenIntent // what the device_token field is asking for
+	deviceToken          string      // the token value when tokenIntent == tokenSet
 	rules                []rules.Rule
 	unreachableDefaulted bool // the field was absent and fell back to the default
 }
@@ -194,9 +197,19 @@ func main() {
 	}
 	sample := collector.Sample
 
+	// The device-token relay reports the phone's APNs token to /v1/device-token
+	// (agent_id + secret auth, like the breach path) whenever the app changes it
+	// in rules.json - on change only, never on every reload.
+	relay, err := newTokenRelay(id.Endpoint, id.AgentID, id.Secret, client, log)
+	if err != nil {
+		// The endpoint already parsed as a URL at identity load, so this is not
+		// expected; disable the relay rather than take the agent down over it.
+		log.Error("device-token relay disabled: cannot derive endpoint", "error", err.Error())
+	}
+
 	watcher := &ruleWatcher{
 		path: rulesPath, log: log, engine: engine, collector: collector,
-		interval: &intervalNanos, unreachable: &unreachableS,
+		interval: &intervalNanos, unreachable: &unreachableS, relay: relay,
 	}
 	watcher.check(true) // startup load: applies rules.json if present, else no rules
 
@@ -234,6 +247,12 @@ func main() {
 		runTickLoop(ctx, func() time.Duration { return sampleInterval }, func() {
 			watcher.check(false)
 			evaluateAndReport(ctx, engine, sample, reporter, log)
+			// Relay the device token if it changed. Runs every tick (not
+			// mtime-gated) so a failed post is retried next tick with the same
+			// value; a no-op when nothing changed.
+			if watcher.relay != nil {
+				watcher.relay.flush(ctx)
+			}
 		})
 	}()
 
@@ -253,6 +272,7 @@ type ruleWatcher struct {
 	collector   *metrics.Collector
 	interval    *atomic.Int64 // nanoseconds, read by the beat loop
 	unreachable *atomic.Int64 // seconds, read by the beat loop and reported on every beat
+	relay       *tokenRelay   // device-token relay; nil disables it (e.g. bad endpoint)
 
 	lastMtime time.Time
 	present   bool
@@ -301,6 +321,12 @@ func (w *ruleWatcher) check(startup bool) {
 
 	w.interval.Store(int64(time.Duration(s.intervalS) * time.Second))
 	w.unreachable.Store(int64(s.unreachableAfterS))
+	// Update the token to communicate from this load. The actual POST happens on
+	// the sample tick (relay.flush), so a transient failure retries; here we only
+	// record what the file now wants sent.
+	if w.relay != nil {
+		w.relay.setDesired(s.tokenIntent, s.deviceToken)
+	}
 	w.engine.UpdateRules(s.rules)
 	w.warnUnevaluable(s.rules)
 	if s.unreachableDefaulted {
@@ -514,9 +540,16 @@ func loadRulesFile(path string) (ruleSettings, error) {
 			Label:     rc.Label,
 		})
 	}
+	// device_token is parsed leniently: a malformed value keeps the previous
+	// token and warns, it does NOT fail the whole load (the rest of the file is
+	// still valid). ABSENT/CLEAR/SET are told apart by the relay.
+	intent, token := parseDeviceToken(rf.DeviceToken)
+
 	return ruleSettings{
 		intervalS:            rf.IntervalS,
 		unreachableAfterS:    unreachable,
+		tokenIntent:          intent,
+		deviceToken:          token,
 		rules:                out,
 		unreachableDefaulted: defaulted,
 	}, nil
