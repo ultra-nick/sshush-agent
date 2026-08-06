@@ -81,6 +81,50 @@ func New(rules []Rule, now func() time.Time) *Engine {
 	return &Engine{rules: rules, now: now, state: st}
 }
 
+// UpdateRules swaps in a new rule set, carrying per-rule state forward only
+// where the excursion being measured is unchanged.
+//
+// A rule is carried over intact - keeping its breached/reported state AND its
+// in-flight duration timer - exactly when a rule of the same id already in
+// force has the same metric, threshold and label. Then a reload mid-excursion
+// (say, the user changed an unrelated rule) does not reset a timer that is
+// still measuring the same thing. Any change to what is measured or the bar it
+// is measured against, and any genuinely new id, starts fresh: unreported with
+// no excursion, exactly as at startup, so the reconciliation behaviour applies
+// and the backend's guarded upsert makes a re-emitted duplicate free. Rules
+// absent from the new set are dropped and stop being evaluated.
+//
+// Single-caller like the rest of the engine: the sample goroutine is the only
+// thing that reloads and evaluates.
+func (e *Engine) UpdateRules(newRules []Rule) {
+	oldByID := make(map[string]Rule, len(e.rules))
+	for _, r := range e.rules {
+		oldByID[r.ID] = r
+	}
+	newState := make(map[string]*ruleState, len(newRules))
+	for _, r := range newRules {
+		if old, ok := oldByID[r.ID]; ok && sameExcursion(old, r) {
+			newState[r.ID] = e.state[r.ID] // carry the existing state pointer
+		} else {
+			newState[r.ID] = &ruleState{}
+		}
+	}
+	e.rules = newRules
+	e.state = newState
+}
+
+// sameExcursion reports whether two rules with the same id measure the same
+// thing against the same bar, so a mid-flight duration timer is still valid.
+// Duration is deliberately excluded: changing only the required length does
+// not change which excursion is being measured.
+func sameExcursion(a, b Rule) bool {
+	return a.Metric == b.Metric && a.Threshold == b.Threshold && a.Label == b.Label
+}
+
+// Rules returns the rule set currently in force. A read-only view for the
+// reload path and tests; callers must not mutate it.
+func (e *Engine) Rules() []Rule { return e.rules }
+
 // Evaluate samples every rule's metric once and returns the transitions to
 // report, in rule order. Rules whose metric yields no information this tick
 // are untouched: their duration timers neither advance toward firing nor

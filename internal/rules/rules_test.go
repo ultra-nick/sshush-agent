@@ -358,3 +358,101 @@ func TestDurationAtTenSecondSampleTick(t *testing.T) {
 		}
 	}
 }
+
+// --- UpdateRules: state preservation across a reload ---
+
+func constSampler(v float64) Sampler {
+	return func(string, string) (float64, bool) { return v, true }
+}
+
+func TestUpdateRulesPreservesTimerWhenUnchanged(t *testing.T) {
+	clock := time.Unix(1_700_000_000, 0)
+	e := New([]Rule{{ID: ruleID, Metric: "cpu", Threshold: 90, Duration: 120 * time.Second}},
+		func() time.Time { return clock })
+
+	e.Evaluate(constSampler(10)) // settle: first determination (clear)
+	clock = clock.Add(10 * time.Second)
+	e.Evaluate(constSampler(95)) // excursion starts here (aboveSince = now)
+	clock = clock.Add(80 * time.Second)
+	if evs := e.Evaluate(constSampler(95)); len(evs) != 0 { // elapsed 80 < 120
+		t.Fatalf("fired before duration: %v", evs)
+	}
+
+	// Reload with the SAME metric/threshold/label (an unrelated edit). The
+	// in-flight excursion timer must survive.
+	e.UpdateRules([]Rule{{ID: ruleID, Metric: "cpu", Threshold: 90, Duration: 120 * time.Second}})
+
+	clock = clock.Add(40 * time.Second) // elapsed 120 from the original aboveSince
+	if got := count(e.Evaluate(constSampler(95)), "breach"); got != 1 {
+		t.Fatalf("breach did not fire at the preserved excursion time (got %d)", got)
+	}
+}
+
+func TestUpdateRulesResetsTimerWhenThresholdChanged(t *testing.T) {
+	clock := time.Unix(1_700_000_000, 0)
+	e := New([]Rule{{ID: ruleID, Metric: "cpu", Threshold: 90, Duration: 120 * time.Second}},
+		func() time.Time { return clock })
+
+	e.Evaluate(constSampler(10))
+	clock = clock.Add(10 * time.Second)
+	e.Evaluate(constSampler(95)) // excursion starts
+	clock = clock.Add(80 * time.Second)
+	e.Evaluate(constSampler(95)) // elapsed 80
+
+	// Threshold changed: the excursion measured is no longer the same, so the
+	// timer resets - it must re-measure the full duration from here.
+	e.UpdateRules([]Rule{{ID: ruleID, Metric: "cpu", Threshold: 85, Duration: 120 * time.Second}})
+
+	// At the would-be original fire time it must NOT fire (timer was reset),
+	// and this evaluation sets the fresh aboveSince.
+	clock = clock.Add(40 * time.Second)
+	if evs := e.Evaluate(constSampler(95)); len(evs) != 0 {
+		t.Fatalf("fired at the old excursion time despite a threshold change: %v", evs)
+	}
+	// A full duration from the reset point is required.
+	clock = clock.Add(120 * time.Second)
+	if got := count(e.Evaluate(constSampler(95)), "breach"); got != 1 {
+		t.Fatalf("breach did not fire after the reset window (got %d)", got)
+	}
+}
+
+func TestUpdateRulesDropsRemovedRule(t *testing.T) {
+	clock := time.Unix(1_700_000_000, 0)
+	e := New([]Rule{{ID: ruleID, Metric: "cpu", Threshold: 90, Duration: 0}},
+		func() time.Time { return clock })
+	e.Evaluate(constSampler(10))
+
+	e.UpdateRules(nil) // rule removed entirely
+	if len(e.Rules()) != 0 {
+		t.Fatalf("removed rule still in force: %v", e.Rules())
+	}
+	// A value that would have breached produces nothing - the rule is gone.
+	if evs := e.Evaluate(constSampler(99)); len(evs) != 0 {
+		t.Fatalf("a removed rule still evaluated: %v", evs)
+	}
+}
+
+func TestUpdateRulesNewRuleStartsUnreported(t *testing.T) {
+	clock := time.Unix(1_700_000_000, 0)
+	const newID = "00000000-0000-4000-8000-00000000000b"
+	e := New([]Rule{{ID: ruleID, Metric: "cpu", Threshold: 90, Duration: 0}},
+		func() time.Time { return clock })
+	e.Evaluate(constSampler(10)) // settle the original
+
+	// Add a new rule. On the next evaluation it must produce its own first
+	// determination (unreported -> a clear here), exactly as at startup.
+	e.UpdateRules([]Rule{
+		{ID: ruleID, Metric: "cpu", Threshold: 90, Duration: 0},
+		{ID: newID, Metric: "mem", Threshold: 80, Duration: 0},
+	})
+	events := e.Evaluate(func(metric, _ string) (float64, bool) {
+		if metric == "mem" {
+			return 50, true // below its threshold
+		}
+		return 10, true // cpu still below
+	})
+	// Only the new rule should emit (the old one already settled to clear).
+	if len(events) != 1 || events[0].Rule.ID != newID || events[0].Direction != "clear" {
+		t.Fatalf("new rule did not emit its first determination: %v", events)
+	}
+}

@@ -128,11 +128,37 @@ install -o root -g root -m 0644 "$SCRIPT_DIR/sshush-agent.service" "$UNIT_DIR/ss
 install -o root -g root -m 0644 "$SCRIPT_DIR/sshush-uninstall.path" "$UNIT_DIR/sshush-uninstall.path"
 install -o root -g root -m 0644 "$SCRIPT_DIR/sshush-uninstall.service" "$UNIT_DIR/sshush-uninstall.service"
 
+# The user rules editing must belong to. sudo sets SUDO_USER to the invoking
+# name; a direct root login leaves it unset, and the fallback gives root, which
+# is correct. This is the one moment root exists in every case (including the
+# password-sudo terminal handoff), so the settings file's ownership is fixed
+# here, at install time, to a user who can then edit it forever without root.
+OWNER="${SUDO_USER:-$(id -un)}"
+
 # install -d resets mode and ownership on a directory that already exists, so a
 # re-run repairs drift rather than leaving a previous cycle's permissions.
 # Config is root-owned and group-readable: readable by the agent, never writable.
 install -d -o root -g "$AGENT_GROUP" -m 0750 "$CONF_DIR"
-install -d -o "$AGENT_USER" -g "$AGENT_GROUP" -m 0750 "$STATE_DIR"
+
+# The state directory must let the OWNER create a temp file and rename it over
+# rules.json (an unprivileged rules edit), while the agent - running as the
+# sshush group - keeps write access for its own state (the uninstall marker).
+# So: owner OWNER, group sshush, mode 0770. Owner and group both get rwx;
+# nobody else has any access. install -d re-applies this on every re-run, which
+# is how re-enrolment after an SSH username change moves ownership to the new
+# user without disturbing file contents.
+install -d -o "$OWNER" -g "$AGENT_GROUP" -m 0770 "$STATE_DIR"
+
+# The settings file: interval_s and rules[]. Owned by OWNER (write) with group
+# sshush (the agent reads it), mode 0644. Created with an empty rule set only
+# when absent - a re-run re-applies ownership and mode but never touches the
+# contents, so a rules edit made since install survives re-enrolment.
+if [ ! -f "$STATE_DIR/rules.json" ]; then
+	printf '{"interval_s":60,"rules":[]}\n' > "$STATE_DIR/rules.json"
+	say "created an empty $STATE_DIR/rules.json (no rules yet)"
+fi
+chown "$OWNER":"$AGENT_GROUP" "$STATE_DIR/rules.json"
+chmod 0644 "$STATE_DIR/rules.json"
 
 # The agent's identity file. Enrolment will write this eventually; until then
 # a config.json shipped next to install.sh is placed here. Root-owned and
@@ -176,11 +202,12 @@ row "$BIN_DIR/sshush-uninstall" "root:root" "0700"
 row "$UNIT_DIR/sshush-agent.service" "root:root" "0644"
 row "$UNIT_DIR/sshush-uninstall.path" "root:root" "0644"
 row "$UNIT_DIR/sshush-uninstall.service" "root:root" "0644"
-row "$CONF_DIR/" "root:$AGENT_GROUP" "0750  read-only to the agent"
+row "$CONF_DIR/" "root:$AGENT_GROUP" "0750  identity dir, root-only"
 if [ "$CONFIG_PLACED" = yes ]; then
-	row "$CONF_DIR/config.json" "root:$AGENT_GROUP" "0640  agent identity"
+	row "$CONF_DIR/config.json" "root:$AGENT_GROUP" "0640  agent identity (secret)"
 fi
-row "$STATE_DIR/" "$AGENT_USER:$AGENT_GROUP" "0750  the only writable path"
+row "$STATE_DIR/" "$OWNER:$AGENT_GROUP" "0770  agent state + user-writable"
+row "$STATE_DIR/rules.json" "$OWNER:$AGENT_GROUP" "0644  settings, editable by $OWNER"
 row "system user $AGENT_USER" "$NOLOGIN" "no home directory"
 
 cat <<EOF

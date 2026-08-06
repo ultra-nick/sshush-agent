@@ -1,16 +1,27 @@
 // Command sshush-agent is the SSHush server-side agent.
 //
-// It reads its identity from /etc/sshush/config.json once at startup, then
-// does exactly one thing forever: POST a heartbeat to the backend every
-// interval. It ignores every response and every error - no retry, no backoff,
-// no state machine, no reaction to any status code. The next beat is always
-// one interval away.
+// Its configuration is split across two files so that rules can be edited
+// without root:
 //
-// That rule is the single most important one in this program. The backend
-// infers presence from beats arriving and absence from beats stopping, so any
-// intelligence added here - retries, buffering, response handling - would only
-// blur the one signal the agent exists to send, and would turn the easiest
-// component to audit into one that needs auditing. Resist it.
+//	/etc/sshush/config.json    root:sshush 0640   the IDENTITY: agent_id,
+//	                                               secret, endpoint,
+//	                                               breach_endpoint. Read once
+//	                                               at startup; missing or
+//	                                               malformed is fatal.
+//	/var/lib/sshush/rules.json <user>:sshush 0644 the SETTINGS: interval_s and
+//	                                               rules[]. Owned by the user
+//	                                               who ran the install, re-read
+//	                                               on change, and never fatal.
+//
+// Credentials need root; settings do not. That split is the whole point: on a
+// server where sudo needs a password, root exists only during the interactive
+// install, so rule editing must not need it afterwards.
+//
+// The agent POSTs a heartbeat every interval and, when rules are configured,
+// samples metrics on a fixed tick and reports state transitions. It ignores
+// every beat response and error - no retry, no backoff, no reaction to any
+// status code. The backend infers presence from beats arriving and absence
+// from beats stopping; any intelligence here would only blur that one signal.
 //
 // On SIGTERM or SIGINT it exits 0, mid-beat or not. The unit uses
 // Restart=on-failure, so a clean stop stays stopped.
@@ -35,6 +46,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -45,35 +57,46 @@ import (
 
 const (
 	configPath = "/etc/sshush/config.json"
+	rulesPath  = "/var/lib/sshush/rules.json"
 
-	// beatTimeout bounds one POST. Config validation keeps every interval at
+	// beatTimeout bounds one POST. Interval validation keeps every interval at
 	// or above minIntervalS, so a request that runs to the full timeout still
 	// completes well before the next beat is due - beats can never stack.
 	beatTimeout  = 10 * time.Second
 	minIntervalS = 30
 
-	// sampleInterval is the FIXED metric-sampling and rule-evaluation rate,
-	// independent of the beat interval and deliberately not configurable. At
-	// 10s the shortest offered duration (60s) is six consecutive readings, so
-	// "sustained" means something regardless of what beat interval the user
-	// chose. Evaluating on the beat tick instead would make a 1-minute rule a
-	// single reading at a 60s beat - firing on one spike, the opposite of
-	// what a duration is for.
+	// defaultIntervalS is the beat cadence when no rules file is present. The
+	// heartbeat must keep working regardless of the settings file, so a missing
+	// rules.json falls back to this rather than stopping.
+	defaultIntervalS = 60
+
+	// sampleInterval is the FIXED metric-sampling, rule-evaluation, and
+	// rules-file-stat rate, independent of the beat interval and deliberately
+	// not configurable. At 10s the shortest offered duration (60s) is six
+	// consecutive readings, so "sustained" means something regardless of what
+	// beat interval the user chose.
 	sampleInterval = 10 * time.Second
 
 	secretLen = 32
 )
 
-// config is the agent's identity and rule set, read once. It is never
-// reloaded: when anything changes - a rule edit included - the app rewrites
-// this file and restarts the agent over SSH. No file watching.
-type config struct {
-	AgentID        string       `json:"agent_id"`
-	Secret         string       `json:"secret"`
-	IntervalS      int          `json:"interval_s"`
-	Endpoint       string       `json:"endpoint"`
-	BreachEndpoint string       `json:"breach_endpoint"`
-	Rules          []ruleConfig `json:"rules"`
+// identity is the credential file (/etc/sshush/config.json), read once at
+// startup and never reloaded - the secret needs root and does not change on a
+// rule edit. Extra fields (a stale interval_s or rules from before the split)
+// are ignored.
+type identity struct {
+	AgentID        string `json:"agent_id"`
+	Secret         string `json:"secret"`
+	Endpoint       string `json:"endpoint"`
+	BreachEndpoint string `json:"breach_endpoint"`
+}
+
+// rulesFileJSON is the settings file (/var/lib/sshush/rules.json), user-owned
+// and re-read on change. interval_s lives here, not in the identity, so a
+// password-sudo user can change the unreachable timing without root.
+type rulesFileJSON struct {
+	IntervalS int          `json:"interval_s"`
+	Rules     []ruleConfig `json:"rules"`
 }
 
 // ruleConfig is one alert rule as written by the app. rules may be absent or
@@ -111,7 +134,7 @@ func main() {
 
 	log := newLogger()
 
-	cfg, err := loadConfig(*insecure)
+	id, err := loadIdentity(*insecure)
 	if err != nil {
 		// An agent with no identity has nothing useful to do. Exit non-zero
 		// and let systemd retry; the message names what is wrong and where.
@@ -119,17 +142,17 @@ func main() {
 		os.Exit(1)
 	}
 
-	if strings.HasPrefix(cfg.Endpoint, "http:") {
+	if strings.HasPrefix(id.Endpoint, "http:") {
 		log.Warn("--insecure: the beat secret crosses the network unencrypted",
-			"endpoint", cfg.Endpoint)
+			"endpoint", id.Endpoint)
 	}
 
 	// The body never changes, so it is built exactly once. This is the only
 	// place the secret leaves the process, and it leaves only toward the
 	// endpoint - never toward a log, on any path.
 	body, err := json.Marshal(map[string]string{
-		"agent_id": cfg.AgentID,
-		"secret":   cfg.Secret,
+		"agent_id": id.AgentID,
+		"secret":   id.Secret,
 	})
 	if err != nil {
 		log.Error("building beat body failed", "error", err.Error())
@@ -140,84 +163,155 @@ func main() {
 	defer stop()
 
 	client := &http.Client{Timeout: beatTimeout}
-	interval := time.Duration(cfg.IntervalS) * time.Second
+
+	// The beat interval lives in shared atomic state because a rules-file
+	// reload on the sample goroutine can change it, and the beat goroutine
+	// reads the new value on its next tick - no restart. Held as nanoseconds.
+	var intervalNanos atomic.Int64
+	intervalNanos.Store(int64(defaultIntervalS) * int64(time.Second))
+
+	// The engine and reporter exist even when there are no rules yet: rules can
+	// APPEAR at runtime when the settings file is written, so the sample loop
+	// always runs and the machinery is always ready. Only the sample goroutine
+	// ever touches the engine and reporter, so the engine stays single-caller
+	// with no mutex.
+	collector := metrics.New(log, runtime.NumCPU())
+	engine := rules.New(nil, time.Now)
+	var reporter *report.Reporter
+	if id.BreachEndpoint != "" {
+		reporter = report.New(id.BreachEndpoint, id.AgentID, id.Secret, client, log)
+	}
+	sample := collector.Sample
+
+	watcher := &ruleWatcher{
+		path: rulesPath, log: log, engine: engine, collector: collector, interval: &intervalNanos,
+	}
+	watcher.check(true) // startup load: applies rules.json if present, else no rules
 
 	log.Info("sshush-agent starting",
-		"agent_id", cfg.AgentID, "endpoint", cfg.Endpoint,
-		"interval", interval, "rules", len(cfg.Rules))
+		"agent_id", id.AgentID, "endpoint", id.Endpoint,
+		"interval", time.Duration(intervalNanos.Load()))
 
-	// Rule machinery exists only when rules do; with none configured the
-	// agent only beats, exactly as before this slice.
-	var (
-		engine   *rules.Engine
-		reporter *report.Reporter
-		sample   rules.Sampler
-	)
-	if len(cfg.Rules) > 0 {
-		collector := metrics.New(log, runtime.NumCPU())
-		rs := make([]rules.Rule, 0, len(cfg.Rules))
-		hasTemp, hasSwap := false, false
-		for _, rc := range cfg.Rules {
-			switch rc.Metric {
-			case "temp":
-				hasTemp = true
-			case "swap":
-				hasSwap = true
-			}
-			rs = append(rs, rules.Rule{
-				ID:        rc.RuleID,
-				Metric:    rc.Metric,
-				Threshold: rc.Threshold,
-				Duration:  time.Duration(rc.DurationS) * time.Second,
-				Label:     rc.Label,
-			})
-		}
-		// An unevaluable rule is not an error, but it deserves one loud line
-		// now rather than eternal silence: a temp rule on sensorless hardware,
-		// or a swap rule on a machine with no swap configured.
-		if hasTemp && !collector.TempAvailable() {
-			log.Warn("a temp rule is configured but no thermal zone is readable; that rule will never evaluate")
-		}
-		if hasSwap && !collector.SwapAvailable() {
-			log.Warn("a swap rule is configured but this machine has no swap; that rule will never evaluate")
-		}
-		engine = rules.New(rs, time.Now)
-		reporter = report.New(cfg.BreachEndpoint, cfg.AgentID, cfg.Secret, client, log)
-		sample = collector.Sample
-	}
-
-	// Two independent timers that share no timing and no mutable state. The
-	// beat keeps its configured interval; sampling runs at the fixed 10s rate
-	// so a duration is made of enough readings to mean "sustained". Only the
-	// sample goroutine ever touches the engine and reporter, so the engine
-	// stays single-caller with no mutex - the beat goroutine only beats.
+	// Two independent timers that share no timing. The beat reads the current
+	// interval each tick; the sample loop re-reads the rules file and evaluates.
 	var wg sync.WaitGroup
 
-	// Beat: immediate first (announce on restart at once), then every
-	// interval_s jittered +-10%, measured from last completion. Unchanged.
+	// Beat: immediate first (announce on restart at once), then every current
+	// interval jittered +-10%, measured from last completion.
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		runTickLoop(ctx, func() time.Duration { return jitter(interval) }, func() {
-			beat(ctx, client, cfg.Endpoint, body, log)
+		runTickLoop(ctx, func() time.Duration {
+			return jitter(time.Duration(intervalNanos.Load()))
+		}, func() {
+			beat(ctx, client, id.Endpoint, body, log)
 		})
 	}()
 
 	// Sample: immediate first (also seeds the delta-metric baselines), then
-	// every fixed sampleInterval. No rules means no sample loop - beat only.
-	if engine != nil {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			runTickLoop(ctx, func() time.Duration { return sampleInterval }, func() {
-				evaluateAndReport(ctx, engine, sample, reporter, log)
-			})
-		}()
-	}
+	// every fixed sampleInterval. Always runs: it re-reads rules.json (one
+	// cheap stat) before evaluating, so a rule or interval change takes effect
+	// within one tick without a restart.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runTickLoop(ctx, func() time.Duration { return sampleInterval }, func() {
+			watcher.check(false)
+			evaluateAndReport(ctx, engine, sample, reporter, log)
+		})
+	}()
 
 	<-ctx.Done()
 	log.Info("sshush-agent stopping")
 	wg.Wait()
+}
+
+// ruleWatcher re-reads the settings file when it changes and swaps the new
+// rules and interval into the running agent. Every field is touched only from
+// the sample goroutine (and once from main at startup, before that goroutine
+// starts), except interval, which is atomic and shared with the beat loop.
+type ruleWatcher struct {
+	path      string
+	log       *slog.Logger
+	engine    *rules.Engine
+	collector *metrics.Collector
+	interval  *atomic.Int64 // nanoseconds, read by the beat loop
+
+	lastMtime time.Time
+	present   bool
+}
+
+// check stats the settings file and, on an mtime change, re-reads it. The
+// three rules that matter most:
+//
+//  1. A file that fails to parse or validate is IGNORED - the rules already in
+//     force stay, and it logs at warn. A malformed file must never silently
+//     stop monitoring.
+//  2. A missing file is not fatal - the previous rules stay in force (which at
+//     startup is none), and the heartbeat keeps running regardless.
+//  3. An interval change takes effect on the beat loop with no restart.
+//
+// startup only affects the wording, so a first-run message reads sensibly.
+func (w *ruleWatcher) check(startup bool) {
+	info, err := os.Stat(w.path)
+	if err != nil {
+		if w.present {
+			w.log.Warn("rules file is gone; keeping the rules already in force", "path", w.path)
+		} else if startup {
+			w.log.Warn("no rules file; starting with no rules - the heartbeat and absence detection still run", "path", w.path)
+		}
+		w.present = false
+		return
+	}
+	if w.present && info.ModTime().Equal(w.lastMtime) {
+		return // unchanged since the last read
+	}
+	// Record the version we are about to read BEFORE parsing, so a file that
+	// fails to parse is not re-read (and re-warned) every tick - only when it
+	// changes again, e.g. when the user fixes it.
+	w.present = true
+	w.lastMtime = info.ModTime()
+
+	interval, rs, perr := loadRulesFile(w.path)
+	if perr != nil {
+		if startup {
+			w.log.Warn("rules file could not be loaded; starting with no rules", "error", perr.Error())
+		} else {
+			w.log.Warn("rules file ignored; keeping the rules already in force", "error", perr.Error())
+		}
+		return
+	}
+
+	w.interval.Store(int64(time.Duration(interval) * time.Second))
+	w.engine.UpdateRules(rs)
+	w.warnUnevaluable(rs)
+	if startup {
+		w.log.Info("rules loaded", "rules", len(rs), "interval_s", interval)
+	} else {
+		w.log.Info("rules reloaded", "rules", len(rs), "interval_s", interval)
+	}
+}
+
+// warnUnevaluable logs the one-line "this rule will never evaluate" warnings on
+// the current rule set: a temp rule with no thermal zone, or a swap rule on a
+// machine without swap. Runs on every applied load (startup and each reload),
+// which is infrequent (user-initiated) so it does not spam.
+func (w *ruleWatcher) warnUnevaluable(rs []rules.Rule) {
+	hasTemp, hasSwap := false, false
+	for _, r := range rs {
+		switch r.Metric {
+		case "temp":
+			hasTemp = true
+		case "swap":
+			hasSwap = true
+		}
+	}
+	if hasTemp && !w.collector.TempAvailable() {
+		w.log.Warn("a temp rule is configured but no thermal zone is readable; that rule will never evaluate")
+	}
+	if hasSwap && !w.collector.SwapAvailable() {
+		w.log.Warn("a swap rule is configured but this machine has no swap; that rule will never evaluate")
+	}
 }
 
 // runTickLoop runs work once immediately, then before every subsequent tick
@@ -241,13 +335,24 @@ func runTickLoop(ctx context.Context, nextInterval func() time.Duration, work fu
 // evaluateAndReport is one sample tick: evaluate every rule's metric, log and
 // queue any transitions, and attempt delivery of everything undelivered
 // (retries included). Called only from the sample goroutine.
+//
+// reporter is nil only when the identity carried no breach_endpoint - a
+// degraded state, since transitions cannot be sent. Evaluation still runs (the
+// engine keeps correct per-rule state) and one warning is enough to surface it.
 func evaluateAndReport(ctx context.Context, engine *rules.Engine, sample rules.Sampler, reporter *report.Reporter, log *slog.Logger) {
-	if events := engine.Evaluate(sample); len(events) > 0 {
-		for _, ev := range events {
-			log.Info("rule transition",
-				"rule_id", ev.Rule.ID, "metric", ev.Rule.Metric,
-				"direction", ev.Direction, "value", ev.Value)
+	events := engine.Evaluate(sample)
+	for _, ev := range events {
+		log.Info("rule transition",
+			"rule_id", ev.Rule.ID, "metric", ev.Rule.Metric,
+			"direction", ev.Direction, "value", ev.Value)
+	}
+	if reporter == nil {
+		if len(events) > 0 {
+			log.Warn("rule transitions detected but no breach_endpoint is configured; not reporting", "count", len(events))
 		}
+		return
+	}
+	if len(events) > 0 {
 		reporter.Enqueue(events)
 	}
 	reporter.Flush(ctx)
@@ -281,55 +386,77 @@ func beat(ctx context.Context, client *http.Client, endpoint string, body []byte
 	log.Debug("beat", "outcome", resp.StatusCode)
 }
 
-// loadConfig reads and validates the identity file.
+// loadIdentity reads and validates the credential file. Missing or malformed
+// is fatal to the caller: an agent with no identity has nothing useful to do.
 //
 // Every error message names the offending field but never echoes its value:
 // the secret must not reach a terminal or the journal on any path, and that
-// includes configuration failures.
-func loadConfig(insecureOK bool) (config, error) {
+// includes configuration failures. Extra fields (a stale interval_s or rules
+// left in this file from before the config split) are ignored by the struct.
+func loadIdentity(insecureOK bool) (identity, error) {
 	raw, err := os.ReadFile(configPath)
 	if err != nil {
-		return config{}, fmt.Errorf("read %s: %w (enrolment or the installer places this file)", configPath, err)
+		return identity{}, fmt.Errorf("read %s: %w (enrolment or the installer places this file)", configPath, err)
 	}
 
-	var cfg config
-	if err := json.Unmarshal(raw, &cfg); err != nil {
-		return config{}, fmt.Errorf("parse %s: %w", configPath, err)
+	var id identity
+	if err := json.Unmarshal(raw, &id); err != nil {
+		return identity{}, fmt.Errorf("parse %s: %w", configPath, err)
 	}
 
-	if !validUUID(cfg.AgentID) {
-		return config{}, fmt.Errorf("%s: agent_id is not a canonical hyphenated uuid", configPath)
+	if !validUUID(id.AgentID) {
+		return identity{}, fmt.Errorf("%s: agent_id is not a canonical hyphenated uuid", configPath)
 	}
-	if !validSecret(cfg.Secret) {
-		return config{}, fmt.Errorf("%s: secret does not decode to exactly %d bytes of base64url", configPath, secretLen)
+	if !validSecret(id.Secret) {
+		return identity{}, fmt.Errorf("%s: secret does not decode to exactly %d bytes of base64url", configPath, secretLen)
 	}
-	if cfg.IntervalS < minIntervalS {
-		// The floor keeps the fixed request timeout well under every
-		// interval, which is what makes overlapping beats impossible.
-		return config{}, fmt.Errorf("%s: interval_s must be at least %d, got %d", configPath, minIntervalS, cfg.IntervalS)
+	if err := checkEndpoint("endpoint", id.Endpoint, insecureOK); err != nil {
+		return identity{}, err
 	}
-
-	if err := checkEndpoint("endpoint", cfg.Endpoint, insecureOK); err != nil {
-		return config{}, err
-	}
-	// breach_endpoint is required only when there are rules to report on.
-	if len(cfg.Rules) > 0 || cfg.BreachEndpoint != "" {
-		if cfg.BreachEndpoint == "" {
-			return config{}, fmt.Errorf("%s: rules are configured but breach_endpoint is missing", configPath)
-		}
-		if err := checkEndpoint("breach_endpoint", cfg.BreachEndpoint, insecureOK); err != nil {
-			return config{}, err
+	// breach_endpoint is validated when present; rules can appear at runtime,
+	// so it belongs in this file even before any rule exists.
+	if id.BreachEndpoint != "" {
+		if err := checkEndpoint("breach_endpoint", id.BreachEndpoint, insecureOK); err != nil {
+			return identity{}, err
 		}
 	}
 
-	if problems := validateRules(cfg.Rules); len(problems) > 0 {
-		// Any invalid rule stops the agent outright - no starting with
-		// partial rules. The app is mid-restart over SSH when this fires
-		// and needs a failure it can attribute to the exact rule.
-		return config{}, fmt.Errorf("%s: invalid rules:\n  - %s", configPath, strings.Join(problems, "\n  - "))
-	}
+	return id, nil
+}
 
-	return cfg, nil
+// loadRulesFile reads, parses and validates the settings file, returning the
+// interval and the rule set. Any error - missing file, bad JSON, out-of-range
+// interval, an invalid rule - is returned for the caller to handle by keeping
+// whatever is already in force. Nothing here is fatal.
+func loadRulesFile(path string) (intervalS int, rs []rules.Rule, err error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return 0, nil, err
+	}
+	var rf rulesFileJSON
+	if err := json.Unmarshal(raw, &rf); err != nil {
+		return 0, nil, fmt.Errorf("parse %s: %w", path, err)
+	}
+	if rf.IntervalS < minIntervalS {
+		// An out-of-range interval is rejected the same way a parse failure
+		// is: the previous value is kept. The floor keeps the request timeout
+		// well under every interval, so beats can never stack.
+		return 0, nil, fmt.Errorf("%s: interval_s must be at least %d, got %d", path, minIntervalS, rf.IntervalS)
+	}
+	if problems := validateRules(rf.Rules); len(problems) > 0 {
+		return 0, nil, fmt.Errorf("%s: invalid rules:\n  - %s", path, strings.Join(problems, "\n  - "))
+	}
+	out := make([]rules.Rule, 0, len(rf.Rules))
+	for _, rc := range rf.Rules {
+		out = append(out, rules.Rule{
+			ID:        rc.RuleID,
+			Metric:    rc.Metric,
+			Threshold: rc.Threshold,
+			Duration:  time.Duration(rc.DurationS) * time.Second,
+			Label:     rc.Label,
+		})
+	}
+	return rf.IntervalS, out, nil
 }
 
 func checkEndpoint(name, raw string, insecureOK bool) error {
