@@ -34,6 +34,7 @@ import (
 	"os/signal"
 	"runtime"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -50,6 +51,15 @@ const (
 	// completes well before the next beat is due - beats can never stack.
 	beatTimeout  = 10 * time.Second
 	minIntervalS = 30
+
+	// sampleInterval is the FIXED metric-sampling and rule-evaluation rate,
+	// independent of the beat interval and deliberately not configurable. At
+	// 10s the shortest offered duration (60s) is six consecutive readings, so
+	// "sustained" means something regardless of what beat interval the user
+	// chose. Evaluating on the beat tick instead would make a 1-minute rule a
+	// single reading at a 60s beat - firing on one spike, the opposite of
+	// what a duration is for.
+	sampleInterval = 10 * time.Second
 
 	secretLen = 32
 )
@@ -176,41 +186,71 @@ func main() {
 		sample = collector.Sample
 	}
 
-	// One tick: beat first - liveness must never wait behind metric reads -
-	// then evaluate rules, queue any transitions, and attempt delivery of
-	// everything undelivered (retries included).
-	tick := func() {
-		beat(ctx, client, cfg.Endpoint, body, log)
-		if engine != nil {
-			if events := engine.Evaluate(sample); len(events) > 0 {
-				for _, ev := range events {
-					log.Info("rule transition",
-						"rule_id", ev.Rule.ID, "metric", ev.Rule.Metric,
-						"direction", ev.Direction, "value", ev.Value)
-				}
-				reporter.Enqueue(events)
-			}
-			reporter.Flush(ctx)
-		}
+	// Two independent timers that share no timing and no mutable state. The
+	// beat keeps its configured interval; sampling runs at the fixed 10s rate
+	// so a duration is made of enough readings to mean "sustained". Only the
+	// sample goroutine ever touches the engine and reporter, so the engine
+	// stays single-caller with no mutex - the beat goroutine only beats.
+	var wg sync.WaitGroup
+
+	// Beat: immediate first (announce on restart at once), then every
+	// interval_s jittered +-10%, measured from last completion. Unchanged.
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		runTickLoop(ctx, func() time.Duration { return jitter(interval) }, func() {
+			beat(ctx, client, cfg.Endpoint, body, log)
+		})
+	}()
+
+	// Sample: immediate first (also seeds the delta-metric baselines), then
+	// every fixed sampleInterval. No rules means no sample loop - beat only.
+	if engine != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			runTickLoop(ctx, func() time.Duration { return sampleInterval }, func() {
+				evaluateAndReport(ctx, engine, sample, reporter, log)
+			})
+		}()
 	}
 
-	// First tick immediately rather than one interval from now: a restarted
-	// agent should announce itself at once, and the first metric samples
-	// double as the baselines for the delta metrics.
-	tick()
+	<-ctx.Done()
+	log.Info("sshush-agent stopping")
+	wg.Wait()
+}
 
+// runTickLoop runs work once immediately, then before every subsequent tick
+// waits nextInterval() - jittered for the beat, fixed for the sample. It is
+// the single tested loop shape both timers use; each call captures its own
+// interval and work, so two loops share nothing. The wait starts only after
+// work returns, so a slow tick delays its own next tick and never stacks -
+// and never touches the other loop.
+func runTickLoop(ctx context.Context, nextInterval func() time.Duration, work func()) {
+	work()
 	for {
 		select {
 		case <-ctx.Done():
-			log.Info("sshush-agent stopping")
 			return
-		case <-time.After(jitter(interval)):
+		case <-time.After(nextInterval()):
 		}
-		// The wait above starts only after the previous tick has returned
-		// (every network call in it is timeout-bounded), so the interval is
-		// measured from last completion and beats can never stack.
-		tick()
+		work()
 	}
+}
+
+// evaluateAndReport is one sample tick: evaluate every rule's metric, log and
+// queue any transitions, and attempt delivery of everything undelivered
+// (retries included). Called only from the sample goroutine.
+func evaluateAndReport(ctx context.Context, engine *rules.Engine, sample rules.Sampler, reporter *report.Reporter, log *slog.Logger) {
+	if events := engine.Evaluate(sample); len(events) > 0 {
+		for _, ev := range events {
+			log.Info("rule transition",
+				"rule_id", ev.Rule.ID, "metric", ev.Rule.Metric,
+				"direction", ev.Direction, "value", ev.Value)
+		}
+		reporter.Enqueue(events)
+	}
+	reporter.Flush(ctx)
 }
 
 // beat sends one heartbeat and deliberately discards the outcome.

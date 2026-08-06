@@ -319,3 +319,42 @@ func TestInterfaceDownStartupReconciliation(t *testing.T) {
 		t.Fatalf("startup clear repeated: %v", evs)
 	}
 }
+
+// At the fixed 10s sample tick, a 60s duration must be made of six consecutive
+// readings - a single spike must not fire. This is the whole point of the
+// sample/beat split: duration is measured in real sample ticks, not in
+// however many readings a beat interval happened to allow.
+func TestDurationAtTenSecondSampleTick(t *testing.T) {
+	h := &harness{clock: time.Unix(1_700_000_000, 0), tick: 10 * time.Second}
+	r := Rule{ID: ruleID, Metric: "cpu", Threshold: 90, Duration: 60 * time.Second}
+	h.engine = New([]Rule{r}, func() time.Time { return h.clock })
+	h.settle(10) // start below, consume the first-determination clear
+
+	// A single spike above threshold: must NOT fire (this is exactly the bug
+	// the split fixes - at a 60s beat this lone reading used to be the whole
+	// "minute").
+	if got := count(h.step(99, true), "breach"); got != 0 {
+		t.Fatalf("a single 10s reading fired the 60s-duration rule (got %d breaches)", got)
+	}
+
+	// Sustained above: fires only once the readings span the full 60s. Entry
+	// times: +10,+20,+30,+40,+50 have elapsed < 60; +60 is the sixth reading.
+	fired := 0
+	for i := 0; i < 5; i++ {
+		fired += count(h.step(99, true), "breach")
+	}
+	if fired != 0 {
+		t.Fatalf("fired %d times before six readings spanned 60s", fired)
+	}
+	if got := count(h.step(99, true), "breach"); got != 1 {
+		t.Fatalf("sixth reading (60s elapsed) = %d breaches, want 1", got)
+	}
+
+	// A dip mid-window resets: the next excursion must again span the full 60s.
+	h.step(10, true)         // clears
+	for i := 0; i < 6; i++ { // +0..+50 elapsed on entry: below 60 until the 7th
+		if got := count(h.step(99, true), "breach"); got != 0 && i < 5 {
+			t.Fatalf("re-fired at reading %d before a fresh 60s window", i)
+		}
+	}
+}

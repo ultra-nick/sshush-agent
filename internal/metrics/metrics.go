@@ -15,8 +15,17 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
+	"time"
 )
+
+// diskTimeout bounds one statfs. Every other metric source is a kernel
+// pseudo-file that cannot block; statfs hits the filesystem and, on an
+// unresponsive NFS or CIFS mount, can block for seconds or indefinitely.
+// Left unbounded it would stall the sample tick and silently stop ALL rule
+// evaluation on the machine - one flaky mount taking out monitoring entirely.
+const diskTimeout = 2 * time.Second
 
 // Collector holds the state that delta-based metrics (cpu) need between
 // samples. Not safe for concurrent use; the agent's single tick loop is the
@@ -25,22 +34,33 @@ type Collector struct {
 	log *slog.Logger
 
 	// Injectable for tests; defaults read the live system.
-	readFile func(string) ([]byte, error)
-	statfs   func(path string) (blocks, bfree, bavail uint64, err error)
-	zones    func() []string
-	numCPU   float64
+	readFile    func(string) ([]byte, error)
+	statfs      func(path string) (blocks, bfree, bavail uint64, err error)
+	zones       func() []string
+	numCPU      float64
+	diskTimeout time.Duration
 
 	prevCPU *CPUCounters
+
+	// diskInflight guards against piling up statfs goroutines on a hung
+	// mount: while a mount's statfs is still blocked from a previous tick, the
+	// next tick skips it instead of spawning another, bounding the leak to one
+	// goroutine per stuck mount. Written by the sample goroutine (set) and the
+	// statfs goroutines (clear), so it needs the mutex.
+	diskMu       sync.Mutex
+	diskInflight map[string]bool
 }
 
 // New returns a Collector reading the live system.
 func New(log *slog.Logger, numCPU int) *Collector {
 	return &Collector{
-		log:      log,
-		readFile: os.ReadFile,
-		statfs:   statfsUsage,
-		zones:    thermalZones,
-		numCPU:   float64(numCPU),
+		log:          log,
+		readFile:     os.ReadFile,
+		statfs:       statfsUsage,
+		zones:        thermalZones,
+		numCPU:       float64(numCPU),
+		diskTimeout:  diskTimeout,
+		diskInflight: make(map[string]bool),
 	}
 }
 
@@ -166,9 +186,11 @@ func (c *Collector) sampleLoad() (float64, bool) {
 }
 
 func (c *Collector) sampleDisk(mount string) (float64, bool) {
-	blocks, bfree, bavail, err := c.statfs(mount)
-	if err != nil {
-		c.log.Debug("metric read failed", "metric", "disk", "label", mount, "error", err.Error())
+	blocks, bfree, bavail, ok := c.statfsBounded(mount)
+	if !ok {
+		// Timed out, still-blocked from a prior tick, or a real error - all
+		// NO INFORMATION, which the engine handles by neither advancing nor
+		// resetting the duration timer.
 		return 0, false
 	}
 	// df's formula: used never counts the root-reserved blocks as available,
@@ -179,6 +201,48 @@ func (c *Collector) sampleDisk(mount string) (float64, bool) {
 		return 0, false
 	}
 	return used / denom * 100, true
+}
+
+// statfsBounded runs statfs with a deadline so a hung mount cannot stall the
+// tick. On timeout it returns no information and leaves the syscall running in
+// the background; while that syscall is still blocked, later ticks for the
+// same mount skip immediately rather than spawning another goroutine.
+func (c *Collector) statfsBounded(mount string) (blocks, bfree, bavail uint64, ok bool) {
+	c.diskMu.Lock()
+	if c.diskInflight[mount] {
+		c.diskMu.Unlock()
+		c.log.Debug("metric read skipped: previous disk statfs still blocked", "metric", "disk", "label", mount)
+		return 0, 0, 0, false
+	}
+	c.diskInflight[mount] = true
+	c.diskMu.Unlock()
+
+	type result struct {
+		blocks, bfree, bavail uint64
+		err                   error
+	}
+	// Buffered so a late syscall never blocks trying to send after we have
+	// already given up on it.
+	ch := make(chan result, 1)
+	go func() {
+		b, f, a, err := c.statfs(mount)
+		c.diskMu.Lock()
+		c.diskInflight[mount] = false
+		c.diskMu.Unlock()
+		ch <- result{b, f, a, err}
+	}()
+
+	select {
+	case r := <-ch:
+		if r.err != nil {
+			c.log.Debug("metric read failed", "metric", "disk", "label", mount, "error", r.err.Error())
+			return 0, 0, 0, false
+		}
+		return r.blocks, r.bfree, r.bavail, true
+	case <-time.After(c.diskTimeout):
+		c.log.Debug("metric read timed out", "metric", "disk", "label", mount, "timeout", c.diskTimeout.String())
+		return 0, 0, 0, false
+	}
 }
 
 func (c *Collector) sampleTemp() (float64, bool) {

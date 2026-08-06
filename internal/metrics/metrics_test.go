@@ -5,7 +5,9 @@ import (
 	"io"
 	"log/slog"
 	"math"
+	"sync/atomic"
 	"testing"
+	"time"
 )
 
 // Fixtures captured from real systems. procStat1/2 include non-zero steal -
@@ -249,5 +251,96 @@ func TestCollectorReadFailureIsNoInformation(t *testing.T) {
 		if _, ok := c.Sample(m, ""); ok {
 			t.Errorf("%s: read failure must yield ok=false", m)
 		}
+	}
+}
+
+// A statfs that blocks past the deadline must yield no information within the
+// timeout, never stall the caller, and never be mistaken for a breach.
+func TestCollectorDiskTimeout(t *testing.T) {
+	release := make(chan struct{})
+	c := New(slog.New(slog.NewTextHandler(io.Discard, nil)), 4)
+	c.diskTimeout = 40 * time.Millisecond
+	c.statfs = func(string) (uint64, uint64, uint64, error) {
+		<-release // hang until the test lets go
+		return 0, 0, 0, nil
+	}
+
+	start := time.Now()
+	_, ok := c.Sample("disk", "/mnt/hung")
+	elapsed := time.Since(start)
+	if ok {
+		t.Error("a hung statfs must yield ok=false (no information)")
+	}
+	if elapsed > 500*time.Millisecond {
+		t.Errorf("disk sample blocked %v, must return near the %v timeout", elapsed, c.diskTimeout)
+	}
+	close(release) // let the leaked goroutine finish so the test is clean
+}
+
+// While one disk mount is hung, every other metric - and other disk mounts -
+// must still sample normally.
+func TestCollectorDiskTimeoutDoesNotStallOthers(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+
+	c := New(slog.New(slog.NewTextHandler(io.Discard, nil)), 4)
+	c.diskTimeout = 40 * time.Millisecond
+	c.readFile = func(path string) ([]byte, error) {
+		switch path {
+		case "/proc/stat":
+			return []byte(procStat2), nil
+		case "/proc/meminfo":
+			return []byte(procMeminfo), nil
+		default:
+			return nil, errors.New("no such file")
+		}
+	}
+	c.statfs = func(mount string) (uint64, uint64, uint64, error) {
+		if mount == "/mnt/hung" {
+			<-release
+		}
+		// A healthy mount: 100 blocks, 50 free/avail -> 50% used.
+		return 100, 50, 50, nil
+	}
+
+	// The hung mount times out...
+	if _, ok := c.Sample("disk", "/mnt/hung"); ok {
+		t.Fatal("hung mount must time out to ok=false")
+	}
+	// ...and a healthy mount still reads.
+	if v, ok := c.Sample("disk", "/"); !ok || v != 50 {
+		t.Errorf("healthy disk after a hung one = (%v, %v), want (50, true)", v, ok)
+	}
+	// ...and non-disk metrics are unaffected.
+	if _, ok := c.Sample("mem", ""); !ok {
+		t.Error("mem sample must work while a disk mount is hung")
+	}
+}
+
+// A mount that stays blocked must not spawn a fresh statfs goroutine every
+// tick: while one is in flight the next tick skips immediately.
+func TestCollectorDiskInflightGuard(t *testing.T) {
+	release := make(chan struct{})
+	defer close(release)
+
+	var calls int32
+	c := New(slog.New(slog.NewTextHandler(io.Discard, nil)), 4)
+	c.diskTimeout = 20 * time.Millisecond
+	c.statfs = func(string) (uint64, uint64, uint64, error) {
+		atomic.AddInt32(&calls, 1)
+		<-release
+		return 0, 0, 0, nil
+	}
+
+	// First tick spawns the (hung) statfs and times out.
+	c.Sample("disk", "/mnt/hung")
+	// Several more ticks while it is still blocked: none spawns another.
+	for i := 0; i < 5; i++ {
+		if _, ok := c.Sample("disk", "/mnt/hung"); ok {
+			t.Fatal("still-blocked mount must yield ok=false")
+		}
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Errorf("statfs spawned %d times for a stuck mount, want exactly 1", got)
 	}
 }
