@@ -7,9 +7,11 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 const hexA = "1111111111111111111111111111111111111111111111111111111111111111"
@@ -17,38 +19,93 @@ const hexB = "2222222222222222222222222222222222222222222222222222222222222222"
 
 func discardLog() *slog.Logger { return slog.New(slog.NewTextHandler(io.Discard, nil)) }
 
-func TestParseDeviceToken(t *testing.T) {
+func TestParseTokenFile(t *testing.T) {
 	cases := []struct {
 		name       string
-		raw        string // the JSON value; "" means the field is absent
+		content    string // the file's raw bytes (absence is the caller's stat, not here)
 		wantIntent tokenIntent
 		wantToken  string
 	}{
-		{"absent", "", tokenAbsent, ""},
-		{"null", "null", tokenClear, ""},
-		{"null padded", "  null ", tokenClear, ""},
-		{"empty string", `""`, tokenClear, ""},
-		{"valid", `"` + hexA + `"`, tokenSet, hexA},
-		{"valid uppercase", `"` + strings.ToUpper(hexA) + `"`, tokenSet, strings.ToUpper(hexA)},
-		{"too short", `"` + hexA[:63] + `"`, tokenMalformed, ""},
-		{"too long", `"` + hexA + `a"`, tokenMalformed, ""},
-		{"non-hex", `"` + strings.Repeat("g", 64) + `"`, tokenMalformed, ""},
-		{"not a string", `12345`, tokenMalformed, ""},
+		{"empty file", "", tokenClear, ""},
+		{"whitespace only", " \n\t ", tokenClear, ""},
+		{"valid", hexA, tokenSet, hexA},
+		{"valid with trailing newline", hexA + "\n", tokenSet, hexA},
+		{"valid uppercase", strings.ToUpper(hexA), tokenSet, strings.ToUpper(hexA)},
+		{"too short", hexA[:63], tokenMalformed, ""},
+		{"too long", hexA + "a", tokenMalformed, ""},
+		{"non-hex", strings.Repeat("g", 64), tokenMalformed, ""},
+		{"multiline garbage", hexA + "\nextra", tokenMalformed, ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			var raw json.RawMessage
-			if c.raw != "" {
-				raw = json.RawMessage(c.raw)
-			}
-			intent, token := parseDeviceToken(raw)
+			intent, token := parseTokenFile([]byte(c.content))
 			if intent != c.wantIntent || token != c.wantToken {
-				t.Errorf("parseDeviceToken(%q) = (%v, %q), want (%v, %q)",
-					c.raw, intent, token, c.wantIntent, c.wantToken)
+				t.Errorf("parseTokenFile(%q) = (%v, %q), want (%v, %q)",
+					c.content, intent, token, c.wantIntent, c.wantToken)
 			}
 		})
 	}
 }
+
+// The watcher end of the pipeline: file lifecycle drives the relay's desire.
+func TestTokenFileWatcher(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/device_token"
+	relay := &tokenRelay{log: discardLog()}
+	w := &tokenFileWatcher{path: path, log: discardLog(), relay: relay}
+
+	// Absent file: nothing to communicate.
+	w.check()
+	if relay.desired != nil {
+		t.Fatal("absent file must not set a desire")
+	}
+
+	// A token appears (e.g. written while the agent was stopped).
+	writeFile(t, path, hexA)
+	w.check()
+	if relay.desired == nil || *relay.desired != hexA {
+		t.Fatalf("desired = %v, want %q", relay.desired, hexA)
+	}
+
+	// Malformed rewrite: keep the previous token, do not clear.
+	writeFile(t, path, "not-a-token")
+	w.check()
+	if relay.desired == nil || *relay.desired != hexA {
+		t.Fatal("malformed file must keep the previous desire")
+	}
+
+	// Emptied file: an explicit clear.
+	writeFile(t, path, "")
+	w.check()
+	if relay.desired == nil || *relay.desired != "" {
+		t.Fatal("empty file must set an explicit clear")
+	}
+
+	// Deleting the file is ABSENT, not clear: the desire stays as it was.
+	if err := os.Remove(path); err != nil {
+		t.Fatal(err)
+	}
+	w.check()
+	if relay.desired == nil || *relay.desired != "" {
+		t.Fatal("removing the file must not change the desire")
+	}
+}
+
+func writeFile(t *testing.T, path, content string) {
+	t.Helper()
+	// A fresh mtime each write: some filesystems have coarse mtime granularity,
+	// and the watcher is mtime-gated. Chtimes makes the change unmissable.
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	now := time.Now()
+	mtimeBump = mtimeBump + time.Second
+	if err := os.Chtimes(path, now, now.Add(mtimeBump)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+var mtimeBump time.Duration
 
 // recorder is a test backend that captures every posted body and can be told to
 // fail the first N attempts.

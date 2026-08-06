@@ -12,6 +12,11 @@
 //	                                               rules[]. Owned by the user
 //	                                               who ran the install, re-read
 //	                                               on change, and never fatal.
+//	/var/lib/sshush/device_token (same owner)      the phone's APNs token, in
+//	                                               its OWN file so the token
+//	                                               writer never rewrites rules
+//	                                               content. Re-read on change;
+//	                                               absent is fine.
 //
 // Credentials need root; settings do not. That split is the whole point: on a
 // server where sudo needs a password, root exists only during the interactive
@@ -58,6 +63,10 @@ import (
 const (
 	configPath = "/etc/sshush/config.json"
 	rulesPath  = "/var/lib/sshush/rules.json"
+	// deviceTokenPath is the app-written token file, deliberately SEPARATE
+	// from rules.json so the token writer never rewrites rules content (see
+	// devicetoken.go for the file format and why).
+	deviceTokenPath = "/var/lib/sshush/device_token"
 
 	// beatTimeout bounds one POST. Interval validation keeps every interval at
 	// or above minIntervalS, so a request that runs to the full timeout still
@@ -106,18 +115,18 @@ type identity struct {
 // warning) is distinguishable from a present-but-out-of-range value (which
 // keeps the previous settings, like any malformed field).
 type rulesFileJSON struct {
-	IntervalS         int             `json:"interval_s"`
-	UnreachableAfterS *int            `json:"unreachable_after_s"`
-	DeviceToken       json.RawMessage `json:"device_token"`
-	Rules             []ruleConfig    `json:"rules"`
+	IntervalS         int          `json:"interval_s"`
+	UnreachableAfterS *int         `json:"unreachable_after_s"`
+	Rules             []ruleConfig `json:"rules"`
 }
 
-// ruleSettings is one successfully loaded settings file.
+// ruleSettings is one successfully loaded settings file. The device token is
+// NOT here: it lives in its own file (see devicetoken.go) so the app's token
+// writer never has to rewrite rules content. A device_token field left in an
+// old rules.json is silently ignored (unknown fields are tolerated).
 type ruleSettings struct {
 	intervalS            int
 	unreachableAfterS    int
-	tokenIntent          tokenIntent // what the device_token field is asking for
-	deviceToken          string      // the token value when tokenIntent == tokenSet
 	rules                []rules.Rule
 	unreachableDefaulted bool // the field was absent and fell back to the default
 }
@@ -209,9 +218,11 @@ func main() {
 
 	watcher := &ruleWatcher{
 		path: rulesPath, log: log, engine: engine, collector: collector,
-		interval: &intervalNanos, unreachable: &unreachableS, relay: relay,
+		interval: &intervalNanos, unreachable: &unreachableS,
 	}
 	watcher.check(true) // startup load: applies rules.json if present, else no rules
+	tokenWatcher := &tokenFileWatcher{path: deviceTokenPath, log: log, relay: relay}
+	tokenWatcher.check() // startup load: picks up a token written while stopped
 
 	log.Info("sshush-agent starting",
 		"agent_id", id.AgentID, "endpoint", id.Endpoint,
@@ -253,12 +264,13 @@ func main() {
 		defer wg.Done()
 		runTickLoop(ctx, func() time.Duration { return sampleInterval }, func() {
 			watcher.check(false)
+			tokenWatcher.check()
 			evaluateAndReport(ctx, engine, sample, reporter, log)
-			// Relay the device token if it changed. Runs every tick (not
+			// Relay the device token if it changed. flush runs every tick (not
 			// mtime-gated) so a failed post is retried next tick with the same
 			// value; a no-op when nothing changed.
-			if watcher.relay != nil {
-				watcher.relay.flush(ctx)
+			if relay != nil {
+				relay.flush(ctx)
 			}
 		})
 	}()
@@ -279,7 +291,6 @@ type ruleWatcher struct {
 	collector   *metrics.Collector
 	interval    *atomic.Int64 // nanoseconds, read by the beat loop
 	unreachable *atomic.Int64 // seconds, read by the beat loop and reported on every beat
-	relay       *tokenRelay   // device-token relay; nil disables it (e.g. bad endpoint)
 
 	lastMtime time.Time
 	present   bool
@@ -328,12 +339,6 @@ func (w *ruleWatcher) check(startup bool) {
 
 	w.interval.Store(int64(time.Duration(s.intervalS) * time.Second))
 	w.unreachable.Store(int64(s.unreachableAfterS))
-	// Update the token to communicate from this load. The actual POST happens on
-	// the sample tick (relay.flush), so a transient failure retries; here we only
-	// record what the file now wants sent.
-	if w.relay != nil {
-		w.relay.setDesired(s.tokenIntent, s.deviceToken)
-	}
 	w.engine.UpdateRules(s.rules)
 	w.warnUnevaluable(s.rules)
 	if s.unreachableDefaulted {
@@ -557,16 +562,9 @@ func loadRulesFile(path string) (ruleSettings, error) {
 			Label:     rc.Label,
 		})
 	}
-	// device_token is parsed leniently: a malformed value keeps the previous
-	// token and warns, it does NOT fail the whole load (the rest of the file is
-	// still valid). ABSENT/CLEAR/SET are told apart by the relay.
-	intent, token := parseDeviceToken(rf.DeviceToken)
-
 	return ruleSettings{
 		intervalS:            rf.IntervalS,
 		unreachableAfterS:    unreachable,
-		tokenIntent:          intent,
-		deviceToken:          token,
 		rules:                out,
 		unreachableDefaulted: defaulted,
 	}, nil

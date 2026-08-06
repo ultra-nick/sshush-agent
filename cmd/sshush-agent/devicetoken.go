@@ -8,44 +8,47 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"os"
+	"time"
 )
 
-// The device-token relay. The app writes the phone's APNs token into the
-// user-owned rules.json (an unprivileged write that works in every escalation
-// case); the agent, which holds the secret, relays it to the backend on change
-// only - the same pattern as unreachable_after_s, but authenticated like the
-// breach path.
+// The device-token relay. The app writes the phone's APNs token into its OWN
+// user-owned file (/var/lib/sshush/device_token - an unprivileged write that
+// works in every escalation case); the agent, which holds the secret, relays
+// it to the backend on change only, authenticated like the breach path.
+//
+// The token deliberately does NOT live in rules.json: rules and the token have
+// different writers with different lifecycles (the rules editor writes what
+// the user just edited; the token sync fires on app launch and token change),
+// and sharing a file forced the token writer to rewrite rules content it had
+// no business owning - a device with a stale rules copy silently reverted the
+// agent's rules while delivering a token. Separate files make that
+// structurally impossible.
 //
 // A device token rots (restore-from-backup, some OS updates, revoked
 // permission), and a stale token means pushes fire into the void for a user who
 // believes they are covered. So the token is relayed whenever it changes, and a
 // CLEAR (the user revoked permission) is relayed too - distinct from ABSENT
-// (the app never wrote one), or a dead token would linger for ever.
+// (the app never wrote the file), or a dead token would linger for ever.
 
-// tokenIntent is what the device_token field in rules.json is asking for.
+// tokenIntent is what the device_token file is asking for.
 type tokenIntent int
 
 const (
-	tokenAbsent    tokenIntent = iota // field not present: do nothing, keep backend state
-	tokenClear                        // null or "": clear the backend's token
+	tokenAbsent    tokenIntent = iota // no file: do nothing, keep backend state
+	tokenClear                        // empty file: clear the backend's token
 	tokenSet                          // a valid 64-hex token: relay it
 	tokenMalformed                    // present but not valid: keep previous, warn
 )
 
-// parseDeviceToken decodes the device_token field, distinguishing all three
-// states the design turns on. RawMessage is used precisely so ABSENT (len 0)
-// can be told apart from an explicit null.
-func parseDeviceToken(raw json.RawMessage) (tokenIntent, string) {
-	if len(raw) == 0 {
-		return tokenAbsent, ""
-	}
-	if string(bytes.TrimSpace(raw)) == "null" {
-		return tokenClear, ""
-	}
-	var s string
-	if err := json.Unmarshal(raw, &s); err != nil {
-		return tokenMalformed, "" // present but not even a string
-	}
+// parseTokenFile decodes the device_token file's CONTENT (absence of the file
+// is decided by the caller's stat, not here): plain text, one value.
+//
+//	empty / whitespace  -> clear (the app revoked permission)
+//	64 hex chars        -> relay that token
+//	anything else       -> malformed: keep the previous token, warn
+func parseTokenFile(content []byte) (tokenIntent, string) {
+	s := string(bytes.TrimSpace(content))
 	if s == "" {
 		return tokenClear, ""
 	}
@@ -53,6 +56,52 @@ func parseDeviceToken(raw json.RawMessage) (tokenIntent, string) {
 		return tokenSet, s
 	}
 	return tokenMalformed, ""
+}
+
+// tokenFileWatcher re-reads the device_token file when it changes and records
+// the new desire on the relay (the POST itself happens on the sample tick via
+// relay.flush, so transient failures retry). Same mtime gating as the rules
+// watcher: a malformed file warns once per version, not once per tick.
+type tokenFileWatcher struct {
+	path  string
+	log   *slog.Logger
+	relay *tokenRelay
+
+	present   bool
+	lastMtime time.Time
+}
+
+func (w *tokenFileWatcher) check() {
+	if w.relay == nil {
+		return
+	}
+	info, err := os.Stat(w.path)
+	if err != nil {
+		// Absent = the app has never written one (or the dir is being torn
+		// down): nothing to communicate, and NOT a clear - deleting the file
+		// must never null a live token. Reset presence so re-creation re-reads.
+		w.present = false
+		return
+	}
+	if w.present && info.ModTime().Equal(w.lastMtime) {
+		return // unchanged since the last read
+	}
+	// Record the version BEFORE parsing so a malformed file is warned once per
+	// version, not every tick (same pattern as the rules watcher).
+	w.present = true
+	w.lastMtime = info.ModTime()
+
+	content, err := os.ReadFile(w.path)
+	if err != nil {
+		w.log.Warn("device token file unreadable; keeping the previous token", "error", err.Error())
+		return
+	}
+	intent, token := parseTokenFile(content)
+	if intent == tokenMalformed {
+		w.log.Warn("device token file is malformed; keeping the previous token")
+		return
+	}
+	w.relay.setDesired(intent, token)
 }
 
 // isHex64 is exactly 64 hexadecimal characters, case-insensitive (the app
@@ -104,7 +153,7 @@ func newTokenRelay(beatEndpoint, agentID, secret string, client *http.Client, lo
 	return &tokenRelay{endpoint: endpoint, agentID: agentID, secret: secret, client: client, log: log}, nil
 }
 
-// setDesired updates what should be communicated from a freshly loaded rules
+// setDesired updates what should be communicated from a freshly loaded token
 // file. ABSENT leaves the current desire untouched (do nothing); MALFORMED keeps
 // the previous value and warns - a bad parse must never clear a live token.
 // Called only when the file actually changed (mtime-gated), so it does not spam.
@@ -113,7 +162,7 @@ func (t *tokenRelay) setDesired(intent tokenIntent, value string) {
 	case tokenAbsent:
 		return
 	case tokenMalformed:
-		t.log.Warn("device_token in the rules file is malformed; keeping the previous token")
+		t.log.Warn("device token file is malformed; keeping the previous token")
 		return
 	case tokenSet:
 		v := value
