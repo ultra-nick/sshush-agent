@@ -208,3 +208,114 @@ func TestBreachClearBreachIsThreeTransitions(t *testing.T) {
 		t.Fatalf("breach/clear/breach = %d transitions, want 3", total)
 	}
 }
+
+// --- interfaceDown: the state rule shares all the engine machinery ---
+
+// newInterfaceHarness drives an interfaceDown rule. The sampled value is the
+// display value: 1 = up, 0 = down. Threshold is ignored for state rules.
+func newInterfaceHarness(duration time.Duration) *harness {
+	h := &harness{clock: time.Unix(1_700_000_000, 0), tick: 30 * time.Second}
+	r := Rule{ID: ruleID, Metric: InterfaceDownMetric, Threshold: 0, Duration: duration}
+	h.engine = New([]Rule{r}, func() time.Time { return h.clock })
+	return h
+}
+
+func TestInterfaceDownStatePolarity(t *testing.T) {
+	// duration 0: down fires immediately, up clears on first sample. The
+	// polarity is the whole point - a naive v>threshold with threshold 0
+	// would breach when UP (value 1), which is backwards.
+	h := newInterfaceHarness(0)
+
+	// Startup while up: one clear (the first determination), then quiet.
+	if got := count(h.step(1, true), "clear"); got != 1 {
+		t.Fatalf("up at startup = %d clear events, want 1", got)
+	}
+	// Interface goes down: breach.
+	if got := count(h.step(0, true), "breach"); got != 1 {
+		t.Fatalf("down = %d breach events, want 1", got)
+	}
+	// Comes back up: clear.
+	if got := count(h.step(1, true), "clear"); got != 1 {
+		t.Fatalf("back up = %d clear events, want 1", got)
+	}
+	// Stays up: nothing.
+	for i := 0; i < 3; i++ {
+		if evs := h.step(1, true); len(evs) != 0 {
+			t.Fatalf("staying up produced %v", evs)
+		}
+	}
+}
+
+func TestInterfaceDownRespectsDuration(t *testing.T) {
+	// duration 120s, tick 30s: a NIC must be continuously down for the full
+	// window before it fires - exactly as a threshold rule gates.
+	h := newInterfaceHarness(120 * time.Second)
+	h.settle(1) // start up, consume the first-determination clear
+
+	fired := 0
+	for i := 0; i < 4; i++ { // down at t=+0,+30,+60,+90: elapsed < 120 on entry
+		fired += count(h.step(0, true), "breach")
+	}
+	if fired != 0 {
+		t.Fatalf("breach fired %d times before the down-duration elapsed", fired)
+	}
+	if got := count(h.step(0, true), "breach"); got != 1 { // elapsed 120
+		t.Fatalf("breach after duration = %d, want 1", got)
+	}
+}
+
+func TestInterfaceDownFlapResetsTheTimer(t *testing.T) {
+	// A flapping NIC with a duration reports nothing: one sample back up
+	// resets the down excursion completely.
+	h := newInterfaceHarness(120 * time.Second)
+	h.settle(1)
+
+	h.step(0, true) // down, timer starts
+	h.step(0, true)
+	h.step(1, true) // flaps up: timer must fully reset
+	fired := 0
+	for i := 0; i < 4; i++ {
+		fired += count(h.step(0, true), "breach")
+	}
+	if fired != 0 {
+		t.Fatalf("flap did not reset the down timer; breach fired %d times", fired)
+	}
+}
+
+func TestInterfaceDownMissingIsNoEvidence(t *testing.T) {
+	// ok=false (interface absent) must neither start nor reset the excursion,
+	// same as any unreadable metric.
+	h := newInterfaceHarness(120 * time.Second)
+	h.settle(1)
+
+	h.step(0, true)  // down, timer starts
+	h.step(0, false) // absent: no information, must not reset
+	h.step(0, true)  // still down
+	h.step(0, true)  // elapsed toward 120 from the first down
+	if got := count(h.step(0, true), "breach"); got != 1 {
+		t.Fatalf("breach after duration with an absent gap = %d, want 1", got)
+	}
+}
+
+// interfaceDown participates in startup reconciliation exactly like a
+// threshold rule: the first settled determination is emitted once, in
+// whichever direction it lands.
+func TestInterfaceDownStartupReconciliation(t *testing.T) {
+	// Down at startup, duration 0: first determination is a breach.
+	down := newInterfaceHarness(0)
+	if got := count(down.step(0, true), "breach"); got != 1 {
+		t.Fatalf("down at startup = %d breach events, want 1 (first determination)", got)
+	}
+	if evs := down.step(0, true); len(evs) != 0 {
+		t.Fatalf("startup breach repeated: %v", evs)
+	}
+
+	// Up at startup: first determination is a clear, then silence.
+	up := newInterfaceHarness(0)
+	if got := count(up.step(1, true), "clear"); got != 1 {
+		t.Fatalf("up at startup = %d clear events, want 1", got)
+	}
+	if evs := up.step(1, true); len(evs) != 0 {
+		t.Fatalf("startup clear repeated: %v", evs)
+	}
+}

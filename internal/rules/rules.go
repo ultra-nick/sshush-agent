@@ -5,6 +5,13 @@ package rules
 
 import "time"
 
+// InterfaceDownMetric is the one STATE rule: it breaches when the named
+// interface is not up. Its sampled value is a display value (1 = up, 0 = down),
+// not a magnitude, so its breach condition is "value is down", never a
+// threshold comparison. This constant is what keeps that polarity in one place
+// instead of scattered "interfaceDown" string checks.
+const InterfaceDownMetric = "interfaceDown"
+
 // Rule is one validated alert rule from config.json. The agent never
 // interprets RuleID beyond relaying it; it is the phone's identifier.
 type Rule struct {
@@ -13,6 +20,19 @@ type Rule struct {
 	Threshold float64
 	Duration  time.Duration
 	Label     string
+}
+
+// breaching reports whether a sampled value is in this rule's breach
+// condition. Threshold rules breach strictly above their threshold; the
+// interfaceDown state rule breaches when the interface is down (sampled as 0),
+// with the threshold ignored entirely. Extracting this predicate is what lets
+// the state rule share every other part of the engine - duration, reporting,
+// transitions - without being forced into the threshold shape.
+func (r Rule) breaching(v float64) bool {
+	if r.Metric == InterfaceDownMetric {
+		return v < 1 // 0 = down = breach; 1 = up (or unknown) = clear
+	}
+	return v > r.Threshold
 }
 
 // Event is one state transition to report.
@@ -76,10 +96,12 @@ func (e *Engine) Evaluate(sample Sampler) []Event {
 			continue
 		}
 
-		if v > r.Threshold {
-			// Slow to alarm: the value must stay above threshold for the
-			// full duration, measured from the start of this excursion. A
-			// single sample below resets the excursion entirely.
+		if r.breaching(v) {
+			// Slow to alarm: the value must stay in breach for the full
+			// duration, measured from the start of this excursion. A single
+			// non-breaching sample resets the excursion entirely - so a
+			// flapping NIC with a 60s duration reports nothing, exactly as a
+			// flapping threshold does.
 			if s.aboveSince.IsZero() {
 				s.aboveSince = now
 			}
@@ -91,7 +113,7 @@ func (e *Engine) Evaluate(sample Sampler) []Event {
 			continue
 		}
 
-		// Fast to reassure: one sample at or below threshold ends a breach.
+		// Fast to reassure: one non-breaching sample ends a breach.
 		s.aboveSince = time.Time{}
 		if s.breached {
 			s.breached = false

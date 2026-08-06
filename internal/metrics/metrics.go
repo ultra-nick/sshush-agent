@@ -16,10 +16,9 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
-	"time"
 )
 
-// Collector holds the state that delta-based metrics (cpu, net) need between
+// Collector holds the state that delta-based metrics (cpu) need between
 // samples. Not safe for concurrent use; the agent's single tick loop is the
 // only caller.
 type Collector struct {
@@ -29,16 +28,9 @@ type Collector struct {
 	readFile func(string) ([]byte, error)
 	statfs   func(path string) (blocks, bfree, bavail uint64, err error)
 	zones    func() []string
-	now      func() time.Time
 	numCPU   float64
 
 	prevCPU *CPUCounters
-	prevNet map[string]netPoint
-}
-
-type netPoint struct {
-	bytes uint64
-	at    time.Time
 }
 
 // New returns a Collector reading the live system.
@@ -48,29 +40,33 @@ func New(log *slog.Logger, numCPU int) *Collector {
 		readFile: os.ReadFile,
 		statfs:   statfsUsage,
 		zones:    thermalZones,
-		now:      time.Now,
 		numCPU:   float64(numCPU),
-		prevNet:  make(map[string]netPoint),
 	}
 }
 
 // Sample returns the current value for a metric, or ok=false when there is no
-// information this tick: a read failure, a missing sensor, or the first
-// sample of a delta-based metric.
+// information this tick: a read failure, a missing sensor, an unconfigured
+// resource, or the first sample of a delta-based metric.
+//
+// For the state metric interfaceDown the value is the DISPLAY value - 1 for
+// up, 0 for down - not a magnitude. The rules engine knows to compare it as a
+// state, not against a threshold.
 func (c *Collector) Sample(metric, label string) (float64, bool) {
 	switch metric {
 	case "cpu":
 		return c.sampleCPU()
 	case "mem":
 		return c.sampleMem()
+	case "swap":
+		return c.sampleSwap()
 	case "load":
 		return c.sampleLoad()
 	case "disk":
 		return c.sampleDisk(label)
-	case "net":
-		return c.sampleNet(label)
 	case "temp":
 		return c.sampleTemp()
+	case "interfaceDown":
+		return c.sampleInterface(label)
 	default:
 		return 0, false
 	}
@@ -82,6 +78,18 @@ func (c *Collector) Sample(metric, label string) (float64, bool) {
 func (c *Collector) TempAvailable() bool {
 	_, ok := c.sampleTemp()
 	return ok
+}
+
+// SwapAvailable reports whether the machine has swap configured. Used once at
+// startup so a swap rule on a swapless machine is called out, exactly as a
+// missing thermal zone is for temp.
+func (c *Collector) SwapAvailable() bool {
+	data, err := c.readFile("/proc/meminfo")
+	if err != nil {
+		return false
+	}
+	_, hasSwap, err := ParseSwapPercent(data)
+	return err == nil && hasSwap
 }
 
 func (c *Collector) sampleCPU() (float64, bool) {
@@ -113,6 +121,26 @@ func (c *Collector) sampleMem() (float64, bool) {
 	v, err := ParseMemPercent(data)
 	if err != nil {
 		c.log.Debug("metric parse failed", "metric", "mem", "error", err.Error())
+		return 0, false
+	}
+	return v, true
+}
+
+func (c *Collector) sampleSwap() (float64, bool) {
+	data, err := c.readFile("/proc/meminfo")
+	if err != nil {
+		c.log.Debug("metric read failed", "metric", "swap", "error", err.Error())
+		return 0, false
+	}
+	v, hasSwap, err := ParseSwapPercent(data)
+	if err != nil {
+		c.log.Debug("metric parse failed", "metric", "swap", "error", err.Error())
+		return 0, false
+	}
+	if !hasSwap {
+		// SwapTotal == 0: swap is not configured. Not an error and not a
+		// breach - the rule is simply never evaluated, exactly as a missing
+		// thermal zone is handled.
 		return 0, false
 	}
 	return v, true
@@ -153,31 +181,6 @@ func (c *Collector) sampleDisk(mount string) (float64, bool) {
 	return used / denom * 100, true
 }
 
-func (c *Collector) sampleNet(iface string) (float64, bool) {
-	data, err := c.readFile("/proc/net/dev")
-	if err != nil {
-		c.log.Debug("metric read failed", "metric", "net", "error", err.Error())
-		return 0, false
-	}
-	bytes, err := ParseNetBytes(data, iface)
-	if err != nil {
-		c.log.Debug("metric parse failed", "metric", "net", "label", iface, "error", err.Error())
-		return 0, false
-	}
-	now := c.now()
-	prev, had := c.prevNet[iface]
-	c.prevNet[iface] = netPoint{bytes: bytes, at: now}
-	if !had {
-		return 0, false
-	}
-	dt := now.Sub(prev.at).Seconds()
-	if dt <= 0 || bytes < prev.bytes {
-		// Counter reset (interface bounce) or no elapsed time: baseline again.
-		return 0, false
-	}
-	return float64(bytes-prev.bytes) * 8 / dt / 1e6, true
-}
-
 func (c *Collector) sampleTemp() (float64, bool) {
 	best := -1.0
 	for _, zone := range c.zones() {
@@ -198,6 +201,36 @@ func (c *Collector) sampleTemp() (float64, bool) {
 		return 0, false
 	}
 	return best, true
+}
+
+// sampleInterface reads an interface's operstate and returns the display
+// value: 1 for up, 0 for down. A missing interface is NO INFORMATION.
+//
+// This is the sample side of the one STATE rule. It returns a value, not a
+// magnitude; the rules engine turns "0 = down" into a breach, never a
+// threshold comparison.
+func (c *Collector) sampleInterface(iface string) (float64, bool) {
+	// Interface names never contain a slash. Rejecting one keeps a malformed
+	// label from escaping the sysfs directory into an arbitrary read.
+	if iface == "" || strings.ContainsRune(iface, '/') {
+		return 0, false
+	}
+	data, err := c.readFile("/sys/class/net/" + iface + "/operstate")
+	if err != nil {
+		// The interface has been removed or renamed: NO INFORMATION. A
+		// renamed NIC must not fire a false alert, and a genuinely absent
+		// interface is indistinguishable from a typo in the config.
+		c.log.Debug("metric read failed", "metric", "interfaceDown", "label", iface, "error", err.Error())
+		return 0, false
+	}
+	state := strings.TrimSpace(string(data))
+	// "unknown" is what many virtual and wireless interfaces report while
+	// working normally; treating it as anything but up would be a permanent
+	// false breach on those machines.
+	if state == "up" || state == "unknown" {
+		return 1, true
+	}
+	return 0, true
 }
 
 // --- pure parsers, fixture-testable ---
@@ -283,6 +316,44 @@ func ParseMemPercent(data []byte) (float64, error) {
 	return (total - avail) / total * 100, nil
 }
 
+// ParseSwapPercent computes used swap percent from /proc/meminfo.
+//
+// The bool is false when SwapTotal is 0: swap is not configured, which is not
+// an error and not a breach - the caller skips the rule, exactly as for a
+// missing thermal zone. An error is returned only for genuinely malformed
+// input.
+func ParseSwapPercent(data []byte) (float64, bool, error) {
+	var total, free float64
+	var haveTotal, haveFree bool
+	for _, line := range strings.Split(string(data), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 2 {
+			continue
+		}
+		switch f[0] {
+		case "SwapTotal:":
+			v, err := strconv.ParseFloat(f[1], 64)
+			if err != nil {
+				return 0, false, fmt.Errorf("SwapTotal: %w", err)
+			}
+			total, haveTotal = v, true
+		case "SwapFree:":
+			v, err := strconv.ParseFloat(f[1], 64)
+			if err != nil {
+				return 0, false, fmt.Errorf("SwapFree: %w", err)
+			}
+			free, haveFree = v, true
+		}
+	}
+	if !haveTotal || !haveFree {
+		return 0, false, fmt.Errorf("meminfo missing SwapTotal or SwapFree")
+	}
+	if total == 0 {
+		return 0, false, nil // swap not configured
+	}
+	return (total - free) / total * 100, true, nil
+}
+
 // ParseLoad1 reads the 1-minute average from /proc/loadavg. The caller
 // divides by core count.
 func ParseLoad1(data []byte) (float64, error) {
@@ -295,31 +366,6 @@ func ParseLoad1(data []byte) (float64, error) {
 		return 0, fmt.Errorf("loadavg: %w", err)
 	}
 	return v, nil
-}
-
-// ParseNetBytes returns rx+tx bytes for one interface from /proc/net/dev.
-func ParseNetBytes(data []byte, iface string) (uint64, error) {
-	for _, line := range strings.Split(string(data), "\n") {
-		idx := strings.IndexByte(line, ':')
-		if idx < 0 || strings.TrimSpace(line[:idx]) != iface {
-			continue
-		}
-		f := strings.Fields(line[idx+1:])
-		// Receive bytes is field 0; transmit bytes is field 8.
-		if len(f) < 9 {
-			return 0, fmt.Errorf("interface %s: %d fields, want at least 9", iface, len(f))
-		}
-		rx, err := strconv.ParseUint(f[0], 10, 64)
-		if err != nil {
-			return 0, fmt.Errorf("interface %s rx: %w", iface, err)
-		}
-		tx, err := strconv.ParseUint(f[8], 10, 64)
-		if err != nil {
-			return 0, fmt.Errorf("interface %s tx: %w", iface, err)
-		}
-		return rx + tx, nil
-	}
-	return 0, fmt.Errorf("interface %s not present in /proc/net/dev", iface)
 }
 
 // --- live-system defaults ---

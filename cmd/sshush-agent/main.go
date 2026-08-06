@@ -77,12 +77,17 @@ type ruleConfig struct {
 }
 
 var validMetrics = map[string]bool{
-	"cpu": true, "mem": true, "disk": true, "load": true, "net": true, "temp": true,
+	"cpu": true, "mem": true, "swap": true, "disk": true,
+	"load": true, "temp": true, "interfaceDown": true,
 }
 
-// labelRequired: disk needs a mount point, net an interface name. For every
-// other metric the label is carried but ignored.
-var labelRequired = map[string]bool{"disk": true, "net": true}
+// validMetricList is the human-readable enum for error messages, in the same
+// order the product presents the alert types.
+const validMetricList = "cpu|mem|swap|disk|load|temp|interfaceDown"
+
+// labelRequired: disk needs a mount point, interfaceDown an interface name.
+// For every other metric the label is carried but ignored.
+var labelRequired = map[string]bool{"disk": true, "interfaceDown": true}
 
 // maxLabelBytes mirrors the backend's cap. Enforcing it here turns a
 // too-long label into a loud startup failure instead of a silent 400 on
@@ -141,10 +146,13 @@ func main() {
 	if len(cfg.Rules) > 0 {
 		collector := metrics.New(log, runtime.NumCPU())
 		rs := make([]rules.Rule, 0, len(cfg.Rules))
-		hasTemp := false
+		hasTemp, hasSwap := false, false
 		for _, rc := range cfg.Rules {
-			if rc.Metric == "temp" {
+			switch rc.Metric {
+			case "temp":
 				hasTemp = true
+			case "swap":
+				hasSwap = true
 			}
 			rs = append(rs, rules.Rule{
 				ID:        rc.RuleID,
@@ -154,10 +162,14 @@ func main() {
 				Label:     rc.Label,
 			})
 		}
-		// Absent sensor is not an error, but a rule that will never evaluate
-		// deserves one loud line now rather than eternal silence.
+		// An unevaluable rule is not an error, but it deserves one loud line
+		// now rather than eternal silence: a temp rule on sensorless hardware,
+		// or a swap rule on a machine with no swap configured.
 		if hasTemp && !collector.TempAvailable() {
 			log.Warn("a temp rule is configured but no thermal zone is readable; that rule will never evaluate")
+		}
+		if hasSwap && !collector.SwapAvailable() {
+			log.Warn("a swap rule is configured but this machine has no swap; that rule will never evaluate")
 		}
 		engine = rules.New(rs, time.Now)
 		reporter = report.New(cfg.BreachEndpoint, cfg.AgentID, cfg.Secret, client, log)
@@ -318,9 +330,12 @@ func validateRules(rs []ruleConfig) []string {
 			seen[r.RuleID] = true
 		}
 		if !validMetrics[r.Metric] {
-			bad(i, r, fmt.Sprintf("metric %q is not one of cpu|mem|disk|load|net|temp", r.Metric))
+			bad(i, r, fmt.Sprintf("metric %q is not one of %s", r.Metric, validMetricList))
 		}
-		if math.IsNaN(r.Threshold) || math.IsInf(r.Threshold, 0) {
+		// interfaceDown is a state rule: its threshold is ignored, so the app
+		// may send any placeholder (0) for a uniform rule shape. Every other
+		// metric's threshold must be a real number.
+		if r.Metric != "interfaceDown" && (math.IsNaN(r.Threshold) || math.IsInf(r.Threshold, 0)) {
 			bad(i, r, "threshold is not a finite number")
 		}
 		if r.DurationS < 0 {

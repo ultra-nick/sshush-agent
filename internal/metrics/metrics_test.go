@@ -6,7 +6,6 @@ import (
 	"log/slog"
 	"math"
 	"testing"
-	"time"
 )
 
 // Fixtures captured from real systems. procStat1/2 include non-zero steal -
@@ -21,23 +20,23 @@ ctxt 654321
 	procStat2 = `cpu  85550 210 34761 8492204 12047 0 2601 1830 0 0
 cpu0 42775 105 17380 4246102 6023 0 1300 915 0 0
 `
+	// Swap present: 2097148 total, 1048574 free -> 50% used.
 	procMeminfo = `MemTotal:        8062924 kB
 MemFree:          234256 kB
 MemAvailable:    4048572 kB
 Buffers:          401232 kB
 Cached:          3121400 kB
+SwapTotal:       2097148 kB
+SwapFree:        1048574 kB
+`
+	// A machine with no swap configured.
+	procMeminfoNoSwap = `MemTotal:        8062924 kB
+MemFree:          234256 kB
+MemAvailable:    4048572 kB
+SwapTotal:             0 kB
+SwapFree:              0 kB
 `
 	procLoadavg = `2.48 1.90 1.55 2/1024 12345
-`
-	procNetDev1 = `Inter-|   Receive                                                |  Transmit
- face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
-    lo: 1234567    2000    0    0    0     0          0         0  1234567    2000    0    0    0     0       0          0
-  eth0: 1000000    2000    0    0    0     0          0         0  2000000    3000    0    0    0     0       0          0
-`
-	// eth0 +900000 rx, +350000 tx = +1250000 bytes; over 1s = 10 Mbit/s.
-	procNetDev2 = `Inter-|   Receive                                                |  Transmit
- face |bytes    packets errs drop fifo frame compressed multicast|bytes    packets errs drop fifo colls carrier compressed
-  eth0: 1900000    2500    0    0    0     0          0         0  2350000    3400    0    0    0     0       0          0
 `
 )
 
@@ -88,6 +87,28 @@ func TestParseMemPercentUsesAvailable(t *testing.T) {
 	}
 }
 
+func TestParseSwapPercent(t *testing.T) {
+	v, hasSwap, err := ParseSwapPercent([]byte(procMeminfo))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !hasSwap {
+		t.Fatal("swap should be reported present")
+	}
+	// (2097148-1048574)/2097148 = 50%.
+	approx(t, v, 50.0, 0.01, "swap percent")
+}
+
+func TestParseSwapPercentNoSwap(t *testing.T) {
+	_, hasSwap, err := ParseSwapPercent([]byte(procMeminfoNoSwap))
+	if err != nil {
+		t.Fatalf("SwapTotal 0 must not be an error: %v", err)
+	}
+	if hasSwap {
+		t.Error("SwapTotal 0 must report hasSwap=false, not a breach")
+	}
+}
+
 func TestParseLoad1(t *testing.T) {
 	v, err := ParseLoad1([]byte(procLoadavg))
 	if err != nil {
@@ -96,21 +117,9 @@ func TestParseLoad1(t *testing.T) {
 	approx(t, v, 2.48, 0.0001, "load1")
 }
 
-func TestParseNetBytes(t *testing.T) {
-	b, err := ParseNetBytes([]byte(procNetDev1), "eth0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if b != 3000000 {
-		t.Errorf("eth0 bytes = %d, want 3000000 (rx+tx)", b)
-	}
-	if _, err := ParseNetBytes([]byte(procNetDev1), "wg0"); err == nil {
-		t.Error("missing interface must be an error")
-	}
-}
-
-// testCollector wires a Collector to scripted file contents and a fake clock.
-func testCollector(files map[string]string, zones []string, clock *time.Time) *Collector {
+// testCollector wires a Collector to scripted file contents. A path present in
+// files reads its value; anything else is a read failure.
+func testCollector(files map[string]string, zones []string) *Collector {
 	c := New(slog.New(slog.NewTextHandler(io.Discard, nil)), 4)
 	c.readFile = func(path string) ([]byte, error) {
 		if data, ok := files[path]; ok {
@@ -119,14 +128,12 @@ func testCollector(files map[string]string, zones []string, clock *time.Time) *C
 		return nil, errors.New("no such file")
 	}
 	c.zones = func() []string { return zones }
-	c.now = func() time.Time { return *clock }
 	return c
 }
 
 func TestCollectorCPUFirstSampleIsBaseline(t *testing.T) {
 	files := map[string]string{"/proc/stat": procStat1}
-	clock := time.Unix(1000, 0)
-	c := testCollector(files, nil, &clock)
+	c := testCollector(files, nil)
 
 	if _, ok := c.Sample("cpu", ""); ok {
 		t.Fatal("first cpu sample must produce nothing")
@@ -139,26 +146,29 @@ func TestCollectorCPUFirstSampleIsBaseline(t *testing.T) {
 	approx(t, v, 90.0, 0.01, "cpu percent via collector")
 }
 
-func TestCollectorNetFirstSampleIsBaseline(t *testing.T) {
-	files := map[string]string{"/proc/net/dev": procNetDev1}
-	clock := time.Unix(1000, 0)
-	c := testCollector(files, nil, &clock)
-
-	if _, ok := c.Sample("net", "eth0"); ok {
-		t.Fatal("first net sample must produce nothing")
-	}
-	files["/proc/net/dev"] = procNetDev2
-	clock = clock.Add(time.Second)
-	v, ok := c.Sample("net", "eth0")
+func TestCollectorSwap(t *testing.T) {
+	c := testCollector(map[string]string{"/proc/meminfo": procMeminfo}, nil)
+	v, ok := c.Sample("swap", "")
 	if !ok {
-		t.Fatal("second net sample must produce a value")
+		t.Fatal("no swap value from a machine with swap")
 	}
-	approx(t, v, 10.0, 0.01, "net Mbit/s")
+	approx(t, v, 50.0, 0.01, "swap percent via collector")
+	if !c.SwapAvailable() {
+		t.Error("SwapAvailable = false with swap configured")
+	}
+
+	// No swap configured: not an error, just no information, and no breach.
+	none := testCollector(map[string]string{"/proc/meminfo": procMeminfoNoSwap}, nil)
+	if _, ok := none.Sample("swap", ""); ok {
+		t.Error("swap sample on a swapless machine must yield ok=false")
+	}
+	if none.SwapAvailable() {
+		t.Error("SwapAvailable = true with no swap")
+	}
 }
 
 func TestCollectorLoadPerCore(t *testing.T) {
-	clock := time.Unix(1000, 0)
-	c := testCollector(map[string]string{"/proc/loadavg": procLoadavg}, nil, &clock)
+	c := testCollector(map[string]string{"/proc/loadavg": procLoadavg}, nil)
 	v, ok := c.Sample("load", "")
 	if !ok {
 		t.Fatal("no load value")
@@ -167,7 +177,6 @@ func TestCollectorLoadPerCore(t *testing.T) {
 }
 
 func TestCollectorTempHighestZoneAndAbsence(t *testing.T) {
-	clock := time.Unix(1000, 0)
 	files := map[string]string{
 		"/sys/class/thermal/thermal_zone0/temp": "48500\n",
 		"/sys/class/thermal/thermal_zone1/temp": "61000\n",
@@ -175,7 +184,7 @@ func TestCollectorTempHighestZoneAndAbsence(t *testing.T) {
 	c := testCollector(files, []string{
 		"/sys/class/thermal/thermal_zone0/temp",
 		"/sys/class/thermal/thermal_zone1/temp",
-	}, &clock)
+	})
 	v, ok := c.Sample("temp", "")
 	if !ok {
 		t.Fatal("no temp value")
@@ -186,7 +195,7 @@ func TestCollectorTempHighestZoneAndAbsence(t *testing.T) {
 	}
 
 	// No zones at all: not an error, just no information.
-	none := testCollector(map[string]string{}, nil, &clock)
+	none := testCollector(map[string]string{}, nil)
 	if _, ok := none.Sample("temp", ""); ok {
 		t.Error("absent sensor must yield ok=false")
 	}
@@ -195,11 +204,49 @@ func TestCollectorTempHighestZoneAndAbsence(t *testing.T) {
 	}
 }
 
+// interfaceDown is a state metric: 1 for up, 0 for down, and NO INFORMATION
+// (ok=false) when the interface is absent. "unknown" counts as up.
+func TestCollectorInterfaceState(t *testing.T) {
+	cases := map[string]struct {
+		operstate string
+		wantVal   float64
+		wantOK    bool
+	}{
+		"up":             {"up\n", 1, true},
+		"down":           {"down\n", 0, true},
+		"unknown":        {"unknown\n", 1, true}, // working virtual/wireless NIC
+		"lowerlayerdown": {"lowerlayerdown\n", 0, true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := testCollector(map[string]string{
+				"/sys/class/net/eth0/operstate": tc.operstate,
+			}, nil)
+			v, ok := c.Sample("interfaceDown", "eth0")
+			if ok != tc.wantOK || v != tc.wantVal {
+				t.Errorf("operstate %q -> (%v, %v), want (%v, %v)", tc.operstate, v, ok, tc.wantVal, tc.wantOK)
+			}
+		})
+	}
+}
+
+func TestCollectorInterfaceMissingIsNoInformation(t *testing.T) {
+	// No operstate file at all: the interface was removed or renamed. Must be
+	// no information, never a breach in either direction.
+	c := testCollector(map[string]string{}, nil)
+	if _, ok := c.Sample("interfaceDown", "eth9"); ok {
+		t.Error("missing interface must yield ok=false")
+	}
+	// A label with a slash must not escape sysfs into an arbitrary read.
+	if _, ok := c.Sample("interfaceDown", "../../etc/hostname"); ok {
+		t.Error("a slashed label must be rejected as no information")
+	}
+}
+
 func TestCollectorReadFailureIsNoInformation(t *testing.T) {
-	clock := time.Unix(1000, 0)
-	c := testCollector(map[string]string{}, nil, &clock)
-	for _, m := range []string{"cpu", "mem", "load", "net"} {
-		if _, ok := c.Sample(m, "eth0"); ok {
+	c := testCollector(map[string]string{}, nil)
+	for _, m := range []string{"cpu", "mem", "swap", "load"} {
+		if _, ok := c.Sample(m, ""); ok {
 			t.Errorf("%s: read failure must yield ok=false", m)
 		}
 	}

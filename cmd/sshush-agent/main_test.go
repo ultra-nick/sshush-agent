@@ -20,11 +20,15 @@ func TestValidateRules(t *testing.T) {
 	}{
 		{name: "valid rule", mutate: func(r *ruleConfig) {}},
 		{name: "valid disk rule with label", mutate: func(r *ruleConfig) { r.Metric = "disk"; r.Label = "/" }},
+		{name: "valid swap rule", mutate: func(r *ruleConfig) { r.Metric = "swap"; r.Threshold = 80 }},
+		{name: "valid interfaceDown rule", mutate: func(r *ruleConfig) { r.Metric = "interfaceDown"; r.Label = "eth0"; r.Threshold = 0 }},
 		{name: "bad uuid", mutate: func(r *ruleConfig) { r.RuleID = "nope" }, wantHint: "canonical hyphenated uuid"},
 		{name: "bad metric", mutate: func(r *ruleConfig) { r.Metric = "uptime" }, wantHint: "not one of"},
+		// net was removed: a config still carrying it must now fail validation.
+		{name: "net metric removed", mutate: func(r *ruleConfig) { r.Metric = "net"; r.Label = "eth0" }, wantHint: "not one of"},
 		{name: "negative duration", mutate: func(r *ruleConfig) { r.DurationS = -1 }, wantHint: "duration_s"},
 		{name: "disk without label", mutate: func(r *ruleConfig) { r.Metric = "disk" }, wantHint: "label is required"},
-		{name: "net without label", mutate: func(r *ruleConfig) { r.Metric = "net" }, wantHint: "label is required"},
+		{name: "interfaceDown without label", mutate: func(r *ruleConfig) { r.Metric = "interfaceDown" }, wantHint: "label is required"},
 		{name: "label too long", mutate: func(r *ruleConfig) { r.Label = strings.Repeat("x", 129) }, wantHint: "max 128"},
 		{
 			name:     "duplicate rule_id",
