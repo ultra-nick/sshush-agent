@@ -172,7 +172,7 @@ func TestWatcherMissingAtRuntimeKeepsPrevious(t *testing.T) {
 	}
 }
 
-func TestWatcherIntervalBelow30Rejected(t *testing.T) {
+func TestWatcherIntervalBelowFloorRejected(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "rules.json")
 	writeFileMtime(t, path, oneRule, time.Unix(1000, 0))
 	w, _, iv, eng := newTestWatcher(t, path)
@@ -180,7 +180,7 @@ func TestWatcherIntervalBelow30Rejected(t *testing.T) {
 
 	// interval_s below the floor invalidates the whole file, so the previous
 	// interval AND the previous rules are kept.
-	writeFileMtime(t, path, `{"interval_s":10,"rules":[]}`, time.Unix(2000, 0))
+	writeFileMtime(t, path, `{"interval_s":10,"rules":[]}`, time.Unix(2000, 0)) // below the 20s floor
 	w.check(false)
 
 	if iv.Load() != nanos(45) {
@@ -229,9 +229,19 @@ func TestLoadRulesFile(t *testing.T) {
 			t.Error("unreachable 3601 accepted")
 		}
 	})
-	t.Run("interval below 30", func(t *testing.T) {
-		if _, err := loadRulesFile(write("low.json", `{"interval_s":29,"rules":[]}`)); err == nil {
-			t.Error("interval 29 accepted")
+	t.Run("interval below the floor", func(t *testing.T) {
+		if _, err := loadRulesFile(write("low.json", `{"interval_s":19,"rules":[]}`)); err == nil {
+			t.Error("interval 19 accepted")
+		}
+	})
+	t.Run("interval at the floor is accepted", func(t *testing.T) {
+		// 20s is what a 1-minute unreachable threshold needs.
+		s, err := loadRulesFile(write("floor.json", `{"interval_s":20,"unreachable_after_s":60,"rules":[]}`))
+		if err != nil {
+			t.Fatalf("interval 20 rejected: %v", err)
+		}
+		if s.intervalS != 20 || s.unreachableAfterS != 60 {
+			t.Errorf("parsed = %+v", s)
 		}
 	})
 	t.Run("malformed json", func(t *testing.T) {
@@ -311,5 +321,52 @@ func TestWatcherUnreachableOutOfRangeKeepsPrevious(t *testing.T) {
 	w.check(false)
 	if w.unreachable.Load() != 300 {
 		t.Errorf("out-of-range unreachable applied: %d, want 300 kept", w.unreachable.Load())
+	}
+}
+
+// The beat timeout is derived from the interval so it can never eat a
+// meaningful share of the silence budget a tight unreachable threshold
+// depends on - and so beats can never stack at any configured cadence.
+func TestBeatTimeoutScalesWithInterval(t *testing.T) {
+	for name, tc := range map[string]struct {
+		interval time.Duration
+		want     time.Duration
+	}{
+		"fastest interval (20s)":  {20 * time.Second, 5 * time.Second},
+		"30s":                     {30 * time.Second, 7500 * time.Millisecond},
+		"default 60s is capped":   {60 * time.Second, 10 * time.Second},
+		"slow interval is capped": {10 * time.Minute, 10 * time.Second},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := beatTimeoutFor(tc.interval); got != tc.want {
+				t.Errorf("beatTimeoutFor(%v) = %v, want %v", tc.interval, got, tc.want)
+			}
+		})
+	}
+}
+
+// The whole point of the floor and the derived timeout: at every offered
+// cadence, ONE lost beat must not exhaust the matching unreachable threshold.
+// Worst case is 2*(interval*1.1) + timeout - two jittered intervals plus the
+// failed request's own timeout.
+func TestOneLostBeatFitsInsideItsThreshold(t *testing.T) {
+	for _, tc := range []struct {
+		intervalS, thresholdS int
+	}{
+		{20, 60},  // the 1-minute option
+		{40, 120}, // 2 minutes
+		{60, 180}, // 3 minutes (and the agent default)
+	} {
+		interval := time.Duration(tc.intervalS) * time.Second
+		worst := 2*time.Duration(float64(interval)*1.1) + beatTimeoutFor(interval)
+		threshold := time.Duration(tc.thresholdS) * time.Second
+		if worst >= threshold {
+			t.Errorf("interval %ds: one lost beat spans %v, which does NOT fit inside a %v threshold",
+				tc.intervalS, worst, threshold)
+		}
+	}
+	// And the floor is low enough to serve the tightest threshold.
+	if minIntervalS > 24 {
+		t.Errorf("minIntervalS=%d is too high to support a 60s threshold", minIntervalS)
 	}
 }

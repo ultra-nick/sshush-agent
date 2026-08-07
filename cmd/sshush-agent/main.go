@@ -68,11 +68,19 @@ const (
 	// devicetoken.go for the file format and why).
 	deviceTokenPath = "/var/lib/sshush/device_token"
 
-	// beatTimeout bounds one POST. Interval validation keeps every interval at
-	// or above minIntervalS, so a request that runs to the full timeout still
-	// completes well before the next beat is due - beats can never stack.
-	beatTimeout  = 10 * time.Second
-	minIntervalS = 30
+	// maxBeatTimeout bounds one POST at the slowest cadence. The ACTUAL timeout
+	// is derived per interval (see beatTimeoutFor): it is always at most a
+	// quarter of the interval, so a request that runs to the full timeout still
+	// completes well before the next beat is due - beats can never stack,
+	// whatever interval is configured.
+	maxBeatTimeout = 10 * time.Second
+	// minIntervalS is 20 so the app can offer a 1-MINUTE unreachable threshold.
+	// The arithmetic that ties them: the backend sees silence, not a timer, so
+	// tolerating one lost beat needs 2*(interval*1.1) + timeout <= threshold.
+	// At interval 20 with its derived 5s timeout that is 49s, inside 60s with
+	// room to spare. Do not lower this without redoing that sum - and note the
+	// app derives interval FROM the chosen threshold, so the two stay in step.
+	minIntervalS = 20
 
 	// defaultIntervalS is the beat cadence when no rules file is present. The
 	// heartbeat must keep working regardless of the settings file, so a missing
@@ -80,8 +88,8 @@ const (
 	defaultIntervalS = 60
 
 	// burstInterval is the beat cadence for the process's FIRST interval (the
-	// startup burst - see the beat loop). Well above beatTimeout so burst
-	// beats can never stack, and short enough that the first accepted beat
+	// startup burst - see the beat loop). Well above any derived beat timeout
+	// so burst beats can never stack, and short enough that the first accepted beat
 	// lands within seconds of the backend's snapshot learning the agent.
 	burstInterval = 10 * time.Second
 
@@ -188,7 +196,9 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	client := &http.Client{Timeout: beatTimeout}
+	// No client-wide Timeout: each request gets its own, derived from the
+	// interval in force when it is sent (see beatTimeoutFor).
+	client := &http.Client{}
 
 	// The beat interval and the reported unreachable_after_s both live in
 	// shared atomic state because a rules-file reload on the sample goroutine
@@ -269,9 +279,12 @@ func main() {
 		}, func() {
 			// The body is rebuilt each beat so it carries the CURRENT
 			// unreachable_after_s (a reload may have changed it) and uptime.
-			beat(ctx, client, id.Endpoint,
+			interval := time.Duration(intervalNanos.Load())
+			bctx, cancel := context.WithTimeout(ctx, beatTimeoutFor(interval))
+			beat(bctx, client, id.Endpoint,
 				buildBeatBody(id.AgentID, id.Secret, unreachableS.Load(),
 					int64(time.Since(procStart).Seconds())), log)
+			cancel()
 		})
 	}()
 
@@ -474,6 +487,17 @@ func buildBeatBody(agentID, secret string, unreachableS, uptimeS int64) []byte {
 // The status code is logged at debug and acted on by no one. The request
 // context is the process context, so SIGTERM mid-beat aborts the request and
 // the loop exits cleanly.
+// beatTimeoutFor bounds one POST at a quarter of the beat interval, capped at
+// maxBeatTimeout. Fixed at 10s it would have eaten half of a 20s interval -
+// and, more importantly, half the silence budget a tight threshold depends on.
+func beatTimeoutFor(interval time.Duration) time.Duration {
+	t := interval / 4
+	if t > maxBeatTimeout {
+		return maxBeatTimeout
+	}
+	return t
+}
+
 func beat(ctx context.Context, client *http.Client, endpoint string, body []byte, log *slog.Logger) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
