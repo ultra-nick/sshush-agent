@@ -79,6 +79,12 @@ const (
 	// rules.json falls back to this rather than stopping.
 	defaultIntervalS = 60
 
+	// burstInterval is the beat cadence for the process's FIRST interval (the
+	// startup burst - see the beat loop). Well above beatTimeout so burst
+	// beats can never stack, and short enough that the first accepted beat
+	// lands within seconds of the backend's snapshot learning the agent.
+	burstInterval = 10 * time.Second
+
 	// unreachable_after_s bounds. It is the single number the app computes and
 	// the agent relays to the backend on every beat: how long of silence
 	// should count as down. The agent never interprets it, only carries it.
@@ -240,11 +246,25 @@ func main() {
 	// backend can spot a crash loop (see beatBody.UptimeS). Process start, not
 	// host boot - a rebooting host is the host's business; a restarting process
 	// is ours.
+	//
+	// STARTUP BURST: for its first full interval the process beats every
+	// burstInterval instead of interval_s. A fresh enrolment's first beat can
+	// land before the backend's auth snapshot includes the new agent (the
+	// snapshot refreshes on a timer) and 401 - and since this agent NEVER
+	// reads responses (the load-bearing rule stays intact: the cadence here
+	// is purely time-based), waiting a whole interval for the second beat
+	// made enrolment hang ~a minute at "waiting for first heartbeat". The
+	// burst keeps uptime_s strictly climbing, which is exactly what the
+	// backend's restart detection (uptime regression) expects of a healthy
+	// process - a burst can never read as a crash loop.
 	procStart := time.Now()
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
 		runTickLoop(ctx, func() time.Duration {
+			if time.Since(procStart) < time.Duration(intervalNanos.Load()) {
+				return jitter(burstInterval)
+			}
 			return jitter(time.Duration(intervalNanos.Load()))
 		}, func() {
 			// The body is rebuilt each beat so it carries the CURRENT
