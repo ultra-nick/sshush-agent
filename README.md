@@ -13,13 +13,17 @@ The agent does four things, and nothing else:
    `endpoint`, then ignores every response and every error - no retry, no backoff, no reaction
    to any status code. The backend infers presence from beats arriving and absence from beats
    stopping.
-2. **Metrics.** It samples local metrics from `/proc` and `/sys`: CPU, memory, disk, load,
-   network, and temperature.
+2. **Metrics.** It samples local metrics from `/proc` and `/sys`: CPU, memory, swap, disk, load,
+   network interface state, and temperature.
 3. **Rules.** It evaluates threshold rules against those samples, on the server. A rule breaches
    only after the value has stayed past its threshold for the rule's full duration, and clears on
    a single sample back the other side - slow to alarm, fast to reassure.
 4. **Breach reports.** When a rule changes state, it POSTs that one transition to
    `breach_endpoint`.
+
+It also relays one value it does not otherwise use: the phone's push-notification token, when
+the app writes one to `/var/lib/sshush/device_token` (see below). The agent holds the secret, so
+it is what tells the backend where alerts should go.
 
 Metrics are read and rules are evaluated entirely on the server; only a crossed threshold is ever
 sent, never the underlying numbers. Beyond those outbound POSTs the agent **never listens on any
@@ -27,16 +31,31 @@ port, executes a remote command, or fetches anything** - its whole network footp
 endpoints you can read in `/etc/sshush/config.json`. An agent with no rules configured simply
 beats; metrics sampling and breach reporting switch on only when rules are present.
 
-The identity and rules file at `/etc/sshush/config.json` (root-owned, group-readable, mode
-`0640`) is read once at startup and never watched or reloaded:
+### Configuration is split across three files
+
+Credentials need root; settings do not. That split is the whole point: on a server where `sudo`
+needs a password, root exists only during the interactive install, so editing rules afterwards
+must not need it.
+
+**1. The identity**, `/etc/sshush/config.json` (`root:sshush`, mode `0640`) - read ONCE at
+startup, never watched or reloaded:
 
 ```json
 {
   "agent_id":        "<uuid>",
   "secret":          "<base64url, 32 bytes>",
-  "interval_s":      60,
   "endpoint":        "https://example.com/v1/beat",
-  "breach_endpoint": "https://example.com/v1/breach",
+  "breach_endpoint": "https://example.com/v1/breach"
+}
+```
+
+**2. The settings**, `/var/lib/sshush/rules.json` (owned by the installing user, mode `0644`) -
+re-read whenever it changes, within about 10 seconds:
+
+```json
+{
+  "interval_s":          60,
+  "unreachable_after_s": 180,
   "rules": [
     {
       "rule_id":    "<uuid>",
@@ -49,13 +68,25 @@ The identity and rules file at `/etc/sshush/config.json` (root-owned, group-read
 }
 ```
 
-`rules` may be empty or omitted, in which case the agent only beats and `breach_endpoint` is not
-needed. Valid metrics are `cpu`, `mem`, `disk`, `load`, `net`, and `temp`; `disk` and `net` take a
-`label` (a mount point or an interface name).
+`rules` may be empty or omitted, in which case the agent only beats. Valid metrics are `cpu`,
+`mem`, `swap`, `disk`, `load`, `temp`, and `interfaceDown`; `disk` takes a mount point as its
+`label` and `interfaceDown` an interface name. `interfaceDown` is a state rule and ignores
+`threshold`. `unreachable_after_s` (60-3600) is how long of silence the backend should treat as
+this server being down; the agent does not act on it, it only reports it on every beat.
+
+**3. The push token**, `/var/lib/sshush/device_token` (same owner) - plain text, re-read on
+change. A 64-character hex token is relayed to the backend; an empty file means "clear it"; no
+file at all means nothing to say. It lives apart from the rules so that writing a token can
+never rewrite your rules, and vice versa.
 
 Both endpoints must be `https://`. The agent refuses to start with a plain-http endpoint unless
 `--insecure` is passed explicitly, because the secret would cross the network unencrypted - that
 is a choice a test environment can make on purpose, not a default anyone can ship by accident.
+
+For its first beat interval a freshly started agent beats every 10 seconds rather than every
+`interval_s`, so a new install is confirmed in seconds instead of a minute. It settles to the
+configured interval after that. The cadence is the only thing that changes: responses are still
+ignored entirely.
 
 Still worth reviewing first: how the agent is installed, what privileges it runs with, and how
 it is removed.
@@ -103,9 +134,17 @@ overwrites every managed file, and starts them again.
 | `/etc/systemd/system/sshush-uninstall.service` | `root:root` | `0644` |
 | `/etc/sshush/` | `root:sshush` | `0750` |
 | `/etc/sshush/config.json` (when shipped) | `root:sshush` | `0640` |
-| `/var/lib/sshush/` | `sshush:sshush` | `0750` |
+| `/var/lib/sshush/` | `<installing user>:sshush` | `0770` |
+| `/var/lib/sshush/rules.json` | `<installing user>:sshush` | `0644` |
+| `/var/lib/sshush/device_token` | `<installing user>:sshush` | `0644` |
 
 It also creates a system user `sshush` with a `nologin` shell and no home directory.
+
+The state directory is owned by the user who ran the install, with the agent's group, so that
+user can edit rules afterwards WITHOUT root - that is the whole reason the configuration is
+split. If that matters to you, note what it means: anyone who can act as that user can change
+what this agent alerts on, and can hand it a push token. The credentials in `/etc/sshush` stay
+root-only either way.
 
 Nothing else on your system is touched. There is no package manager integration, no cron entry,
 and no modification of any existing file.
