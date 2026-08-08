@@ -370,3 +370,43 @@ func TestOneLostBeatFitsInsideItsThreshold(t *testing.T) {
 		t.Errorf("minIntervalS=%d is too high to support a 60s threshold", minIntervalS)
 	}
 }
+
+// The ceiling mirrors the backend's enrolment bound; above it the whole file
+// is rejected (keeping previous settings), which also forecloses the
+// nanosecond-conversion overflow that turned the beat loop into a hot spin.
+func TestIntervalCeiling(t *testing.T) {
+	dir := t.TempDir()
+	write := func(name, content string) string {
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, []byte(content), 0644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	if _, err := loadRulesFile(write("big.json", `{"interval_s":86401,"rules":[]}`)); err == nil {
+		t.Error("interval 86401 accepted")
+	}
+	if _, err := loadRulesFile(write("overflow.json", `{"interval_s":10000000000,"rules":[]}`)); err == nil {
+		t.Error("overflowing interval accepted")
+	}
+	if s, err := loadRulesFile(write("day.json", `{"interval_s":86400,"unreachable_after_s":3600,"rules":[]}`)); err != nil {
+		t.Errorf("interval 86400 rejected: %v", err)
+	} else if s.intervalS != 86400 {
+		t.Errorf("parsed = %+v", s)
+	}
+}
+
+// A hand-edited interval/threshold pair that cannot survive one lost beat is
+// APPLIED (both values are individually valid) but warned about loudly.
+func TestInconsistentIntervalThresholdWarns(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "rules.json")
+	writeFileMtime(t, path, `{"interval_s":3600,"unreachable_after_s":3600,"rules":[]}`, time.Unix(1000, 0))
+	w, buf, iv, _ := newTestWatcher(t, path)
+	w.check(true)
+	if iv.Load() != nanos(3600) {
+		t.Fatalf("inconsistent-but-valid file not applied; interval = %d", iv.Load())
+	}
+	if !strings.Contains(buf.String(), "too slow for unreachable_after_s") {
+		t.Errorf("missing consistency warning, log:\n%s", buf.String())
+	}
+}

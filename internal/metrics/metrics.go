@@ -336,8 +336,14 @@ func ParseCPU(data []byte) (CPUCounters, error) {
 }
 
 // CPUPercent computes percent busy across the interval between two readings.
+//
+// BOTH counters are guarded against regression, symmetrically. Busy includes
+// steal, and hypervisors can regress the steal counter across a live
+// migration (observed on KVM cloud hosts); a Busy regression small enough to
+// leave Total climbing would otherwise wrap the uint64 subtraction to ~1.8e19
+// and report a quintillion-percent CPU sample as valid.
 func CPUPercent(prev, cur CPUCounters) (float64, bool) {
-	if cur.Total <= prev.Total {
+	if cur.Total <= prev.Total || cur.Busy < prev.Busy {
 		return 0, false
 	}
 	dBusy := float64(cur.Busy - prev.Busy)

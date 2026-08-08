@@ -49,6 +49,7 @@ import (
 	"os"
 	"os/signal"
 	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -74,6 +75,14 @@ const (
 	// completes well before the next beat is due - beats can never stack,
 	// whatever interval is configured.
 	maxBeatTimeout = 10 * time.Second
+	// maxIntervalS mirrors the backend's enrolment bound. The reader is the
+	// last line of defence for a hand-edited rules.json: without a ceiling,
+	// interval_s past ~9.2e9 overflowed the nanosecond conversion to a
+	// NEGATIVE duration and turned the beat loop into a hot spin against the
+	// backend; merely-large values starved the threshold instead. A day is
+	// far beyond any legitimate monitoring cadence.
+	maxIntervalS = 86400
+
 	// minIntervalS is 20 so the app can offer a 1-MINUTE unreachable threshold.
 	// The arithmetic that ties them: the backend sees silence, not a timer, so
 	// tolerating one lost beat needs 2*(interval*1.1) + timeout <= threshold.
@@ -92,6 +101,18 @@ const (
 	// so burst beats can never stack, and short enough that the first accepted beat
 	// lands within seconds of the backend's snapshot learning the agent.
 	burstInterval = 10 * time.Second
+
+	// reportTimeout bounds one breach-report or device-token POST. These run
+	// on the sample goroutine (10s ticks), so the bound must exist - an
+	// unbounded hang freezes all rule evaluation - but need not be tight:
+	// the reporter stops at the first retryable failure, so a down backend
+	// costs one timeout per tick, not one per queued request.
+	reportTimeout = 15 * time.Second
+
+	// seqPath is the breach reporter's durable seq high-water mark, in the
+	// state dir (the unit's one writable path). Best-effort - see
+	// report.nextSeq for why losing it is safe.
+	seqPath = "/var/lib/sshush/last_seq"
 
 	// unreachable_after_s bounds. It is the single number the app computes and
 	// the agent relays to the backend on every beat: how long of silence
@@ -173,10 +194,35 @@ var labelRequired = map[string]bool{"disk": true, "interfaceDown": true}
 // every future breach report.
 const maxLabelBytes = 128
 
+// buildRevision is the VCS revision embedded by `go build` (the same value
+// AGENT_VERSION pins in the app bundle), or "unknown" for a build outside a
+// git checkout.
+func buildRevision() string {
+	if info, ok := debug.ReadBuildInfo(); ok {
+		for _, kv := range info.Settings {
+			if kv.Key == "vcs.revision" {
+				return kv.Value
+			}
+		}
+	}
+	return "unknown"
+}
+
 func main() {
 	insecure := flag.Bool("insecure", false,
 		"permit a plain-http endpoint (testing only: the secret crosses the network unencrypted)")
+	version := flag.Bool("version", false,
+		"print the agent version (the built revision) and exit")
 	flag.Parse()
+
+	if *version {
+		// The app's rules editor probes this over SSH before offering settings
+		// only newer agents accept (an old agent errors on the unknown flag,
+		// which reads as "predates every probeable feature"). Keep the output
+		// one line: "sshush-agent <revision>".
+		fmt.Println("sshush-agent " + buildRevision())
+		return
+	}
 
 	log := newLogger()
 
@@ -196,9 +242,18 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stop()
 
-	// No client-wide Timeout: each request gets its own, derived from the
-	// interval in force when it is sent (see beatTimeoutFor).
+	// The BEAT client has no client-wide Timeout: each beat derives its own
+	// per-request timeout from the interval in force when it is sent (see
+	// beatTimeoutFor).
 	client := &http.Client{}
+	// Breach reports and token posts get a separate, PLAINLY BOUNDED client.
+	// They run on the sample goroutine - the only caller of the rule engine,
+	// the rules.json watcher, and the reporter - so a single hung connection
+	// (a peer that completes TLS but never sends headers) would freeze all
+	// monitoring while the separately-bounded beat kept the agent looking
+	// healthy. That exact hole shipped when the old client-wide timeout was
+	// removed and only the beat path got a replacement.
+	reportClient := &http.Client{Timeout: reportTimeout}
 
 	// The beat interval and the reported unreachable_after_s both live in
 	// shared atomic state because a rules-file reload on the sample goroutine
@@ -218,14 +273,14 @@ func main() {
 	engine := rules.New(nil, time.Now)
 	var reporter *report.Reporter
 	if id.BreachEndpoint != "" {
-		reporter = report.New(id.BreachEndpoint, id.AgentID, id.Secret, client, log)
+		reporter = report.New(id.BreachEndpoint, id.AgentID, id.Secret, reportClient, log, seqPath)
 	}
 	sample := collector.Sample
 
 	// The device-token relay reports the phone's APNs token to /v1/device-token
 	// (agent_id + secret auth, like the breach path) whenever the app changes it
 	// in rules.json - on change only, never on every reload.
-	relay, err := newTokenRelay(id.Endpoint, id.AgentID, id.Secret, client, log)
+	relay, err := newTokenRelay(id.Endpoint, id.AgentID, id.Secret, reportClient, log)
 	if err != nil {
 		// The endpoint already parsed as a URL at identity load, so this is not
 		// expected; disable the relay rather than take the agent down over it.
@@ -271,9 +326,18 @@ func main() {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		// The burst LATCHES off: comparing process age against the current
+		// interval each tick re-entered the burst when a rules reload raised
+		// interval_s mid-first-interval (age 35s < new 60s), and with a large
+		// hand-edited interval would have kept 10s beats going for its whole
+		// span. One flag, flipped once, single-goroutine.
+		burstOver := false
 		runTickLoop(ctx, func() time.Duration {
-			if time.Since(procStart) < time.Duration(intervalNanos.Load()) {
-				return jitter(burstInterval)
+			if !burstOver {
+				if time.Since(procStart) < time.Duration(intervalNanos.Load()) {
+					return jitter(burstInterval)
+				}
+				burstOver = true
 			}
 			return jitter(time.Duration(intervalNanos.Load()))
 		}, func() {
@@ -378,6 +442,18 @@ func (w *ruleWatcher) check(startup bool) {
 		w.log.Warn("rules file has no unreachable_after_s; using the default",
 			"default_s", defaultUnreachableS)
 	}
+	// The one-lost-beat consistency check the app enforces when IT writes the
+	// file: 2*(interval*1.1) + timeout <= threshold. A hand-edit can break it;
+	// the file is still applied (the values are individually valid and
+	// refusing would strand the previous settings for ever), but the journal
+	// says plainly what the combination will do.
+	interval := time.Duration(s.intervalS) * time.Second
+	worst := 2*time.Duration(float64(interval)*1.1) + beatTimeoutFor(interval)
+	if worst >= time.Duration(s.unreachableAfterS)*time.Second {
+		w.log.Warn("interval_s is too slow for unreachable_after_s: a single lost beat can be reported as an outage",
+			"interval_s", s.intervalS, "unreachable_after_s", s.unreachableAfterS,
+			"worst_gap_s", int(worst.Seconds()))
+	}
 	if startup {
 		w.log.Info("rules loaded", "rules", len(s.rules),
 			"interval_s", s.intervalS, "unreachable_after_s", s.unreachableAfterS)
@@ -448,7 +524,15 @@ func evaluateAndReport(ctx context.Context, engine *rules.Engine, sample rules.S
 		return
 	}
 	if len(events) > 0 {
-		reporter.Enqueue(events)
+		// The full current rule set rides along as the backend's rule-removal
+		// signal: rows for ids not listed are pruned server-side, so retired
+		// rules stop counting toward the backend's per-agent rule cap.
+		rs := engine.Rules()
+		ids := make([]string, len(rs))
+		for i, rule := range rs {
+			ids[i] = rule.ID
+		}
+		reporter.Enqueue(events, ids)
 	}
 	reporter.Flush(ctx)
 }
@@ -575,6 +659,9 @@ func loadRulesFile(path string) (ruleSettings, error) {
 	var rf rulesFileJSON
 	if err := json.Unmarshal(raw, &rf); err != nil {
 		return ruleSettings{}, fmt.Errorf("parse %s: %w", path, err)
+	}
+	if rf.IntervalS > maxIntervalS {
+		return ruleSettings{}, fmt.Errorf("%s: interval_s must be at most %d, got %d", path, maxIntervalS, rf.IntervalS)
 	}
 	if rf.IntervalS < minIntervalS {
 		// The floor keeps the request timeout well under every interval, so

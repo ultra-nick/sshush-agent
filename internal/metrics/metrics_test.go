@@ -344,3 +344,14 @@ func TestCollectorDiskInflightGuard(t *testing.T) {
 		t.Errorf("statfs spawned %d times for a stuck mount, want exactly 1", got)
 	}
 }
+
+// Busy regression (a hypervisor resetting the steal counter across a live
+// migration) must invalidate the sample, exactly as a Total regression does -
+// unguarded, the uint64 subtraction wrapped to a quintillion-percent CPU.
+func TestCPUPercentRejectsBusyRegression(t *testing.T) {
+	prev := CPUCounters{Busy: 1000, Total: 10000}
+	cur := CPUCounters{Busy: 990, Total: 10500} // Busy fell, Total still climbed
+	if v, ok := CPUPercent(prev, cur); ok {
+		t.Errorf("busy regression accepted as %v%%, want rejected", v)
+	}
+}

@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -72,7 +73,7 @@ func (s *script) seqs(t *testing.T) []int64 {
 func newTestReporter(url string, clock *time.Time) *Reporter {
 	r := New(url, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", testSecret,
 		&http.Client{Timeout: 2 * time.Second},
-		slog.New(slog.NewTextHandler(io.Discard, nil)))
+		slog.New(slog.NewTextHandler(io.Discard, nil)), "")
 	r.now = func() time.Time { return *clock }
 	return r
 }
@@ -108,7 +109,7 @@ func TestRetryReusesOriginalSeqAndBytes(t *testing.T) {
 
 	clock := time.Unix(5000, 0)
 	r := newTestReporter(srv.URL, &clock)
-	r.Enqueue(testEvent("breach"))
+	r.Enqueue(testEvent("breach"), nil)
 
 	for i := 0; i < 3; i++ {
 		clock = clock.Add(31 * time.Second) // time passes between ticks
@@ -139,11 +140,11 @@ func TestNewTransitionGetsNewSeqOldKeepsOld(t *testing.T) {
 
 	clock := time.Unix(5000, 0)
 	r := newTestReporter(srv.URL, &clock)
-	r.Enqueue(testEvent("breach"))
+	r.Enqueue(testEvent("breach"), nil)
 	r.Flush(context.Background()) // fails, stays queued
 
 	clock = time.Unix(5060, 0)
-	r.Enqueue(testEvent("clear")) // separate request, its own seq
+	r.Enqueue(testEvent("clear"), nil) // separate request, its own seq
 	if r.Pending() != 2 {
 		t.Fatalf("pending = %d, want 2 (never merged into the committed request)", r.Pending())
 	}
@@ -173,9 +174,9 @@ func TestFlushStopsAtFirstRetryableFailure(t *testing.T) {
 
 	clock := time.Unix(5000, 0)
 	r := newTestReporter(srv.URL, &clock)
-	r.Enqueue(testEvent("breach"))
+	r.Enqueue(testEvent("breach"), nil)
 	clock = time.Unix(5030, 0)
-	r.Enqueue(testEvent("clear"))
+	r.Enqueue(testEvent("clear"), nil)
 
 	r.Flush(context.Background())
 	if len(sc.bodies) != 1 {
@@ -193,9 +194,9 @@ func TestPermanent4xxDropsOnlyThatRequest(t *testing.T) {
 
 	clock := time.Unix(5000, 0)
 	r := newTestReporter(srv.URL, &clock)
-	r.Enqueue(testEvent("breach"))
+	r.Enqueue(testEvent("breach"), nil)
 	clock = time.Unix(5030, 0)
-	r.Enqueue(testEvent("clear"))
+	r.Enqueue(testEvent("clear"), nil)
 
 	r.Flush(context.Background())
 	if r.Pending() != 0 {
@@ -213,35 +214,26 @@ func Test429IsRetryableNotADrop(t *testing.T) {
 
 	clock := time.Unix(5000, 0)
 	r := newTestReporter(srv.URL, &clock)
-	r.Enqueue(testEvent("breach"))
+	r.Enqueue(testEvent("breach"), nil)
 	r.Flush(context.Background())
 	if r.Pending() != 1 {
 		t.Fatalf("pending = %d after 429, want 1 (throttled is not rejected)", r.Pending())
 	}
 }
 
-func TestStaleBodyCountsAsDelivered(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte(`{"stale":true}`))
-	}))
-	defer srv.Close()
-
-	clock := time.Unix(5000, 0)
-	r := newTestReporter(srv.URL, &clock)
-	r.Enqueue(testEvent("breach"))
-	r.Flush(context.Background())
-	if r.Pending() != 0 {
-		t.Fatal(`{"stale":true} must count as delivered - the backend has the information`)
-	}
-}
+// (TestStaleBodyCountsAsDelivered is deliberately GONE: stale no longer
+// counts as delivered. A stale verdict means the backend refused the events
+// and never will accept them at that seq - counting it as delivered silently
+// lost every post-restart report on a clock-regressed host. See
+// TestStaleResponseAdoptsAndResends / TestStaleTwiceDrops for the current
+// contract.)
 
 func TestQueueCapDropsOldest(t *testing.T) {
 	clock := time.Unix(5000, 0)
 	r := newTestReporter("http://unused.invalid", &clock)
 
 	for i := 0; i < maxQueue+4; i++ {
-		r.Enqueue(testEvent("breach"))
+		r.Enqueue(testEvent("breach"), nil)
 	}
 	if r.Pending() != maxQueue {
 		t.Fatalf("pending = %d, want %d", r.Pending(), maxQueue)
@@ -252,5 +244,118 @@ func TestQueueCapDropsOldest(t *testing.T) {
 	}
 	if r.queue[len(r.queue)-1].seq != 5019 {
 		t.Fatalf("newest surviving seq = %d, want 5019", r.queue[len(r.queue)-1].seq)
+	}
+}
+
+// The wire request names the agent's full current rule set - the backend's
+// rule-removal signal.
+func TestEnqueueCarriesRuleIDs(t *testing.T) {
+	var got wireRequest
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(body, &got)
+		_, _ = w.Write([]byte(`{"accepted":1}`))
+	}))
+	defer srv.Close()
+	clock := time.Unix(3_000_000_000, 0)
+	r := newTestReporter(srv.URL, &clock)
+	r.Enqueue(testEvent("breach"), []string{"6ba7b810-9dad-11d1-80b4-00c04fd430c8", "00000000-0000-4000-8000-00000000000c"})
+	r.Flush(context.Background())
+	if len(got.RuleIDs) != 2 {
+		t.Fatalf("rule_ids = %v, want the 2 current rules", got.RuleIDs)
+	}
+}
+
+// The stale self-heal: a clock regressed across a restart produces a seq at
+// or below the backend's high-water mark. The old behaviour counted the
+// stale 2xx as delivered and silently lost the events; now the backend's
+// last_seq is adopted and the SAME events are re-sent under a fresh seq.
+func TestStaleResponseAdoptsAndResends(t *testing.T) {
+	type gotReq struct {
+		seq    int64
+		events int
+	}
+	var reqs []gotReq
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var wire wireRequest
+		_ = json.Unmarshal(body, &wire)
+		reqs = append(reqs, gotReq{wire.Seq, len(wire.Events)})
+		if wire.Seq <= 5000 { // the backend's high-water mark
+			_, _ = w.Write([]byte(`{"stale":true,"last_seq":5000}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"accepted":1}`))
+	}))
+	defer srv.Close()
+
+	clock := time.Unix(1000, 0) // regressed WAY behind the mark
+	r := newTestReporter(srv.URL, &clock)
+	r.Enqueue(testEvent("breach"), nil)
+	r.Flush(context.Background())
+
+	if len(reqs) != 2 {
+		t.Fatalf("requests = %d, want stale then re-send", len(reqs))
+	}
+	if reqs[0].seq != 1000 {
+		t.Errorf("first seq = %d, want the clock's 1000", reqs[0].seq)
+	}
+	if reqs[1].seq != 5001 {
+		t.Errorf("re-sent seq = %d, want 5001 (adopted mark + 1)", reqs[1].seq)
+	}
+	if reqs[1].events != reqs[0].events {
+		t.Errorf("re-send changed the events: %d vs %d", reqs[1].events, reqs[0].events)
+	}
+	if r.Pending() != 0 {
+		t.Errorf("queue = %d, want drained", r.Pending())
+	}
+}
+
+// One rebuild per request, so a backend that answers stale for ever cannot
+// wedge the queue.
+func TestStaleTwiceDrops(t *testing.T) {
+	calls := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		calls++
+		_, _ = w.Write([]byte(`{"stale":true}`)) // old backend: no last_seq either
+	}))
+	defer srv.Close()
+	clock := time.Unix(1000, 0)
+	r := newTestReporter(srv.URL, &clock)
+	r.Enqueue(testEvent("breach"), nil)
+	r.Flush(context.Background())
+	if calls != 2 {
+		t.Errorf("attempts = %d, want exactly 2 (original + one rebuild)", calls)
+	}
+	if r.Pending() != 0 {
+		t.Errorf("queue = %d, want the wedged request dropped", r.Pending())
+	}
+}
+
+// The durable high-water mark: a new Reporter over the same seqPath resumes
+// past the previous process's last seq even when the clock regressed.
+func TestSeqPersistsAcrossRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "last_seq")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"accepted":1}`))
+	}))
+	defer srv.Close()
+
+	clock := time.Unix(9_000, 0)
+	r1 := New(srv.URL, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", testSecret,
+		&http.Client{Timeout: 2 * time.Second},
+		slog.New(slog.NewTextHandler(io.Discard, nil)), path)
+	r1.now = func() time.Time { return clock }
+	r1.Enqueue(testEvent("breach"), nil) // seq 9000, persisted
+	r1.Flush(context.Background())
+
+	// "Restart" with the clock regressed to 100.
+	regressed := time.Unix(100, 0)
+	r2 := New(srv.URL, "6ba7b810-9dad-11d1-80b4-00c04fd430c8", testSecret,
+		&http.Client{Timeout: 2 * time.Second},
+		slog.New(slog.NewTextHandler(io.Discard, nil)), path)
+	r2.now = func() time.Time { return regressed }
+	if got := r2.nextSeq(); got != 9001 {
+		t.Errorf("post-restart seq = %d, want 9001 (stored mark + 1, not the regressed clock)", got)
 	}
 }
