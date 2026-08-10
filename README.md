@@ -71,8 +71,10 @@ re-read whenever it changes, within about 10 seconds:
 `rules` may be empty or omitted, in which case the agent only beats. Valid metrics are `cpu`,
 `mem`, `swap`, `disk`, `load`, `temp`, and `interfaceDown`; `disk` takes a mount point as its
 `label` and `interfaceDown` an interface name. `interfaceDown` is a state rule and ignores
-`threshold`. `unreachable_after_s` (60-3600) is how long of silence the backend should treat as
-this server being down; the agent does not act on it, it only reports it on every beat.
+`threshold`. `interval_s` (20-86400) is the beat cadence. `unreachable_after_s` (60-3600) is how
+long of silence the backend should treat as this server being down; the agent does not act on
+it, it only reports it on every beat. A settings file whose `interval_s` is too slow to survive
+one lost beat within `unreachable_after_s` is applied but logs a warning.
 
 **3. The push token**, `/var/lib/sshush/device_token` (same owner) - plain text, re-read on
 change. A 64-character hex token is relayed to the backend; an empty file means "clear it"; no
@@ -136,7 +138,11 @@ overwrites every managed file, and starts them again.
 | `/etc/sshush/config.json` (when shipped) | `root:sshush` | `0640` |
 | `/var/lib/sshush/` | `<installing user>:sshush` | `0770` |
 | `/var/lib/sshush/rules.json` | `<installing user>:sshush` | `0644` |
-| `/var/lib/sshush/device_token` | `<installing user>:sshush` | `0644` |
+| `/var/lib/sshush/device_token`* | `<installing user>:sshush` | `0644` |
+
+\*`device_token` is not written by the installer - it appears only if and when the app relays a
+push token (same owner and mode). The installer creates `rules.json` (empty) and, when a
+`config.json` is shipped alongside, installs that.
 
 It also creates a system user `sshush` with a `nologin` shell and no home directory.
 

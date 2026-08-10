@@ -1,6 +1,6 @@
 // Command sshush-agent is the SSHush server-side agent.
 //
-// Its configuration is split across two files so that rules can be edited
+// Its configuration is split across three files so that rules can be edited
 // without root:
 //
 //	/etc/sshush/config.json    root:sshush 0640   the IDENTITY: agent_id,
