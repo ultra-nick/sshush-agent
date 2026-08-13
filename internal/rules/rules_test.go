@@ -484,6 +484,46 @@ func TestEvaluateSamplesEachMetricOncePerTick(t *testing.T) {
 	}
 }
 
+// The memo key must not vary on labels the metric IGNORES: a hand-edited file
+// can decorate a cpu rule with any label (validation allows it; the push shows
+// it), and keying the memo on that label split the reading and resurrected the
+// exact starvation above - two cpu rules with differing labels made two
+// sampler calls, the second's delta window microseconds wide.
+func TestEvaluateIgnoredLabelSharesOneSample(t *testing.T) {
+	clock := time.Unix(1_700_000_000, 0)
+	e := New([]Rule{
+		{ID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", Metric: "cpu", Threshold: 50, Duration: 0, Label: "web tier"},
+		{ID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", Metric: "cpu", Threshold: 90, Duration: 0, Label: "db tier"},
+	}, func() time.Time { return clock })
+
+	calls := 0
+	evs := e.Evaluate(func(metric, label string) (float64, bool) {
+		calls++
+		return 95, true
+	})
+	if calls != 1 {
+		t.Fatalf("sampler called %d times for two labelled cpu rules, want 1 (label ignored for cpu)", calls)
+	}
+	if got := count(evs, "breach"); got != 2 {
+		t.Fatalf("breaches = %d, want both rules to evaluate off the shared reading", got)
+	}
+
+	// Label-CONSUMING metrics keep distinct readings per label: two disk rules
+	// on different mounts must sample twice.
+	e2 := New([]Rule{
+		{ID: "cccccccc-cccc-4ccc-8ccc-cccccccccccc", Metric: "disk", Threshold: 90, Duration: 0, Label: "/"},
+		{ID: "dddddddd-dddd-4ddd-8ddd-dddddddddddd", Metric: "disk", Threshold: 90, Duration: 0, Label: "/var"},
+	}, func() time.Time { return clock })
+	calls = 0
+	e2.Evaluate(func(metric, label string) (float64, bool) {
+		calls++
+		return 10, true
+	})
+	if calls != 2 {
+		t.Fatalf("sampler called %d times for two disk mounts, want 2 (label consumed)", calls)
+	}
+}
+
 // A blind stretch longer than maxBlindGap invalidates an in-flight excursion:
 // one breaching sample + hours unreadable + one recovery-edge sample used to
 // fire a "sustained" breach observed for only two ticks.

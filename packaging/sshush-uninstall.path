@@ -4,8 +4,11 @@ Description=Watch for the SSHush uninstall marker
 [Path]
 # Triggers sshush-uninstall.service (matched by unit name, so no Unit= needed).
 #
-# The marker's contents are never read. It carries exactly one bit of meaning:
-# the sshush user asked to be uninstalled. /var/lib/sshush is the agent's only
+# The marker's content feeds exactly one bounded equality check in the script:
+# up to 64 bytes, compared against this install's own agent_id from
+# config.json (mismatch = remove the marker and exit WITHOUT uninstalling;
+# empty = proceed, for markers written by older app versions). It is never
+# interpolated into a path or command. /var/lib/sshush is the agent's only
 # writable path, which is what lets an unprivileged agent request this.
 PathExists=/var/lib/sshush/uninstall
 

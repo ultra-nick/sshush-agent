@@ -189,13 +189,18 @@ unit rather than by giving the agent any privilege:
 `sshush-uninstall.path` watches for a file at `/var/lib/sshush/uninstall`. When that file
 appears, systemd runs `sshush-uninstall` as root.
 
-The file's **contents are never read**. Nothing in the uninstall script is derived from it, from
-the environment, or from any argument. Every path the script touches is a hardcoded absolute
-literal. The marker carries exactly one bit of meaning: *the `sshush` user asked*.
+The file's contents are used for **exactly one bounded equality check**, and nothing else. The
+script reads at most 64 bytes of the marker and compares them to this install's own `agent_id`
+from `/etc/sshush/config.json`: on a mismatch it removes the marker and exits **without
+uninstalling** - the check exists so a request that roamed in from another device's stale state
+cannot remove a newer re-enrolment. An empty marker (older app versions wrote one) skips the
+check and proceeds. The content is never interpolated into a path, a command, or anything else;
+every path the script touches is a hardcoded absolute literal.
 
 The consequence is the property that matters. An attacker who completely compromises the agent
-gains the ability to uninstall it, and nothing else. They cannot redirect the root-level deletion
-somewhere else, because there is no input to redirect. They cannot replace `/var/lib/sshush` with
+gains the ability to uninstall it, and nothing else. The marker's content cannot redirect the
+root-level deletion somewhere else, because it never feeds anything - a mismatched marker only
+makes the script do *less* (nothing at all). They cannot replace `/var/lib/sshush` with
 a symlink either, since `/var/lib` is owned by root, and symlinks planted inside it are not
 followed during removal.
 

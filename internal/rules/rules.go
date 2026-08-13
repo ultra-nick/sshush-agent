@@ -136,6 +136,14 @@ func sameExcursion(a, b Rule) bool {
 	return a.Metric == b.Metric && a.Threshold == b.Threshold && a.Label == b.Label
 }
 
+// LabelRequired names the metrics whose label the sampler actually consumes
+// (disk: a mount point; interfaceDown: an interface name). For every other
+// metric the label is carried on the wire but ignored - and the engine's
+// per-tick memo blanks it, so all label-ignoring rules on a metric share one
+// reading. The validator in cmd/sshush-agent uses this same map; keep it the
+// only definition.
+var LabelRequired = map[string]bool{"disk": true, "interfaceDown": true}
+
 // Rules returns the rule set currently in force. A read-only view for the
 // reload path and tests; callers must not mutate it.
 func (e *Engine) Rules() []Rule { return e.rules }
@@ -163,6 +171,16 @@ func (e *Engine) Evaluate(sample Sampler) []Event {
 	}
 	memo := make(map[[2]string]sampled, len(e.rules))
 	sampleOnce := func(metric, label string) (float64, bool) {
+		// Metrics that ignore the label must share ONE reading regardless of
+		// what a hand-edited file put there: keying on a decorative label
+		// splits the memo and resurrects exactly the double-sample starvation
+		// above (two cpu rules with differing labels = two sampler calls, the
+		// second's delta window microseconds wide and always rejected). The
+		// sampler ignores the label for these metrics anyway, so blanking it
+		// changes nothing about the reading.
+		if !LabelRequired[metric] {
+			label = ""
+		}
 		key := [2]string{metric, label}
 		if m, done := memo[key]; done {
 			return m.v, m.ok

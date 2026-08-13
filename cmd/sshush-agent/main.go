@@ -178,10 +178,6 @@ var validMetrics = map[string]bool{
 // order the product presents the alert types.
 const validMetricList = "cpu|mem|swap|disk|load|temp|interfaceDown"
 
-// labelRequired: disk needs a mount point, interfaceDown an interface name.
-// For every other metric the label is carried but ignored.
-var labelRequired = map[string]bool{"disk": true, "interfaceDown": true}
-
 // maxRules mirrors the backend's store.MaxAlertRules. Without it, a
 // hand-edited file with more rules validated cleanly - and then EVERY breach
 // request carried >64 rule_ids and was 422ed and dropped, forever, while
@@ -846,7 +842,7 @@ func validateRules(rs []ruleConfig) []string {
 		if r.DurationS < 0 || r.DurationS > maxDurationS {
 			bad(i, r, fmt.Sprintf("duration_s must be in [0, %d], got %d", maxDurationS, r.DurationS))
 		}
-		if labelRequired[r.Metric] && r.Label == "" {
+		if rules.LabelRequired[r.Metric] && r.Label == "" {
 			bad(i, r, fmt.Sprintf("label is required for metric %q (mount point or interface name)", r.Metric))
 		}
 		if len(r.Label) > maxLabelBytes {
