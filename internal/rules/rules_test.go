@@ -456,3 +456,77 @@ func TestUpdateRulesNewRuleStartsUnreported(t *testing.T) {
 		t.Fatalf("new rule did not emit its first determination: %v", events)
 	}
 }
+
+// MARK: audit-round tests - per-tick memoization and bounded blind crediting.
+
+// Two rules on the same metric must share ONE sampler reading per tick: the
+// cpu sampler keeps delta state and is not idempotent, so the second of two
+// cpu rules used to receive a microseconds-window reading the regression
+// guard rejected - silently never evaluating.
+func TestEvaluateSamplesEachMetricOncePerTick(t *testing.T) {
+	clock := time.Unix(1_700_000_000, 0)
+	e := New([]Rule{
+		{ID: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa", Metric: "cpu", Threshold: 50, Duration: 0},
+		{ID: "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", Metric: "cpu", Threshold: 90, Duration: 0},
+	}, func() time.Time { return clock })
+
+	calls := 0
+	evs := e.Evaluate(func(metric, label string) (float64, bool) {
+		calls++
+		return 95, true
+	})
+	if calls != 1 {
+		t.Fatalf("sampler called %d times for two cpu rules, want 1 (shared reading)", calls)
+	}
+	// BOTH rules evaluated off that one reading: both breach (95 > 50, 95 > 90).
+	if got := count(evs, "breach"); got != 2 {
+		t.Fatalf("breaches = %d, want both cpu rules to evaluate", got)
+	}
+}
+
+// A blind stretch longer than maxBlindGap invalidates an in-flight excursion:
+// one breaching sample + hours unreadable + one recovery-edge sample used to
+// fire a "sustained" breach observed for only two ticks.
+func TestLongBlindStretchRestartsExcursion(t *testing.T) {
+	clock := time.Unix(1_700_000_000, 0)
+	e := New([]Rule{{ID: ruleID, Metric: "disk", Threshold: 90, Duration: 300 * time.Second, Label: "/x"}},
+		func() time.Time { return clock })
+
+	e.Evaluate(constSampler(10)) // settle: first determination
+	clock = clock.Add(10 * time.Second)
+	e.Evaluate(constSampler(95)) // excursion starts
+	// Hours of no information (hung mount).
+	for i := 0; i < 3; i++ {
+		clock = clock.Add(2 * time.Hour)
+		e.Evaluate(func(string, string) (float64, bool) { return 0, false })
+	}
+	clock = clock.Add(10 * time.Second)
+	// Recovery edge still above threshold: must NOT fire (timer restarted).
+	if evs := e.Evaluate(constSampler(95)); count(evs, "breach") != 0 {
+		t.Fatal("a blind-credited 'sustained' breach fired off two observed ticks")
+	}
+	// A genuinely sustained excursion after the restart still fires.
+	clock = clock.Add(301 * time.Second)
+	if evs := e.Evaluate(constSampler(95)); count(evs, "breach") != 1 {
+		t.Fatal("the restarted excursion must still fire after a full observed duration")
+	}
+}
+
+// A SHORT blind step stays credited (decision 6's bounded-crediting boundary,
+// pinned so the gap bound cannot silently widen to zero).
+func TestShortBlindStepStaysCredited(t *testing.T) {
+	clock := time.Unix(1_700_000_000, 0)
+	e := New([]Rule{{ID: ruleID, Metric: "cpu", Threshold: 90, Duration: 60 * time.Second}},
+		func() time.Time { return clock })
+
+	e.Evaluate(constSampler(10))
+	clock = clock.Add(10 * time.Second)
+	e.Evaluate(constSampler(95)) // excursion starts
+	clock = clock.Add(30 * time.Second)
+	e.Evaluate(func(string, string) (float64, bool) { return 0, false }) // one blind tick
+	clock = clock.Add(30 * time.Second)
+	// 60s since aboveSince, blind step only 30s: credited, fires.
+	if evs := e.Evaluate(constSampler(95)); count(evs, "breach") != 1 {
+		t.Fatal("a short blind step must stay credited toward the duration")
+	}
+}

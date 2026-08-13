@@ -120,7 +120,8 @@ func New(endpoint, agentID, secret string, client *http.Client, log *slog.Logger
 //     self-heals on the first rejected report instead of losing it.
 //
 // Within the process the sequence is strictly increasing regardless of clock
-// steps. (Unix seconds stay inside the backend's INT32 column until 2038.)
+// steps. (The backend's last_seq column is BIGINT - migration 010 - and its
+// handler bound is MaxInt64, so unix-seconds seqs never hit a ceiling.)
 func (r *Reporter) nextSeq() int64 {
 	v := r.now().Unix()
 	if v <= r.lastSeq {
@@ -186,6 +187,26 @@ func (r *Reporter) Enqueue(events []rules.Event, ruleIDs []string) {
 	}
 }
 
+// EnqueueReconcile freezes an events-EMPTY request carrying only the current
+// rule set - the rule-REMOVAL signal. The prune otherwise only travelled on
+// some other rule's transition, so deleting a rule while it was breached left
+// the backend's alert_state row wedged at 'breach': the eventual re-enable's
+// first-determination breach was then swallowed by the backend's state-change
+// guard during a genuinely live breach. The backend treats an events-empty
+// body with rule_ids as a reconcile (seq advance + prune, nothing upserted).
+func (r *Reporter) EnqueueReconcile(ruleIDs []string) {
+	p, ok := r.freeze(nil, ruleIDs)
+	if !ok {
+		return
+	}
+	r.queue = append(r.queue, p)
+	if len(r.queue) > maxQueue {
+		dropped := len(r.queue) - maxQueue
+		r.log.Warn("breach queue full, dropping oldest", "dropped", dropped, "seq", r.queue[0].seq)
+		r.queue = r.queue[dropped:]
+	}
+}
+
 // freeze builds one pending request under a fresh seq. Shared by Enqueue and
 // the stale-rebuild path so both produce identical bytes for the same events.
 func (r *Reporter) freeze(events []wireEvent, ruleIDs []string) (pending, bool) {
@@ -195,6 +216,9 @@ func (r *Reporter) freeze(events []wireEvent, ruleIDs []string) (pending, bool) 
 		Seq:     r.nextSeq(),
 		Events:  events,
 		RuleIDs: ruleIDs,
+	}
+	if wire.Events == nil {
+		wire.Events = []wireEvent{} // a reconcile marshals "events":[], never null
 	}
 	if wire.RuleIDs == nil {
 		wire.RuleIDs = []string{}

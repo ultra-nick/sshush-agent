@@ -355,3 +355,88 @@ func TestCPUPercentRejectsBusyRegression(t *testing.T) {
 		t.Errorf("busy regression accepted as %v%%, want rejected", v)
 	}
 }
+
+// MARK: audit-round fixtures - hostile/malformed inputs and the new guards.
+
+func TestSampleTempRejectsGarbageZone(t *testing.T) {
+	// One flaky zone reporting INT_MAX millidegrees must be NO INFORMATION,
+	// not a "valid" ~2,147,483 C sample (which breached the temp rule AND
+	// 400ed the whole breach batch at the backend's +-1e6 bound).
+	c := testCollector(map[string]string{
+		"/z/broken": "9223372036854775807",
+		"/z/real":   "48250",
+	}, []string{"/z/broken", "/z/real"})
+	v, ok := c.Sample("temp", "")
+	if !ok || v != 48.25 {
+		t.Fatalf("temp = %v ok=%v, want the real zone's 48.25 with the garbage zone ignored", v, ok)
+	}
+	// ALL zones garbage: no information at all.
+	c = testCollector(map[string]string{"/z/broken": "2147483647000"}, []string{"/z/broken"})
+	if _, ok := c.Sample("temp", ""); ok {
+		t.Fatal("a garbage-only zone set must yield no information")
+	}
+}
+
+func TestSampleTempNegativeIsInformation(t *testing.T) {
+	// The outdoor Pi: hottest zone below 0 C is a real reading, not "no
+	// sensor" (the old -1.0 sentinel conflated the two).
+	c := testCollector(map[string]string{"/z/cold": "-12500"}, []string{"/z/cold"})
+	v, ok := c.Sample("temp", "")
+	if !ok || v != -12.5 {
+		t.Fatalf("temp = %v ok=%v, want -12.5 true", v, ok)
+	}
+	if !c.TempAvailable() {
+		t.Fatal("TempAvailable must be true for a working-but-cold sensor")
+	}
+}
+
+func TestDiskPercentInconsistentStatfsIsNoInformation(t *testing.T) {
+	// bfree > blocks wrapped the uint64 subtraction and latched a false
+	// ~100% page. Inconsistent numbers are no information.
+	if _, ok := DiskPercent(100, 150, 40); ok {
+		t.Fatal("bfree > blocks must be no information")
+	}
+	if _, ok := DiskPercent(100, 40, 150); ok {
+		t.Fatal("bavail > blocks must be no information")
+	}
+	// Sane numbers still compute df's formula.
+	v, ok := DiskPercent(100, 40, 30)
+	if !ok || v < 66.66 || v > 66.67 {
+		t.Fatalf("DiskPercent = %v ok=%v, want ~66.67 true", v, ok)
+	}
+}
+
+func TestCPUPercentIowaitRegressionIsNoInformation(t *testing.T) {
+	// iowait is in Total but not Busy and is non-monotonic on SMP: a partial
+	// regression that leaves Total climbing shrinks dTotal below dBusy and
+	// used to yield >100% "valid" samples.
+	prev := CPUCounters{Busy: 100, Total: 200}
+	cur := CPUCounters{Busy: 110, Total: 202} // dBusy 10 > dTotal 2
+	if _, ok := CPUPercent(prev, cur); ok {
+		t.Fatal("dBusy > dTotal must be no information")
+	}
+}
+
+func TestParsersRejectMalformedInput(t *testing.T) {
+	// Every parse-error branch reachable by a fixture, so a refactor turning
+	// an error into a zero-value success (a false 0% / false clear) fails
+	// the suite instead of shipping.
+	if _, err := ParseCPU([]byte("cpu 1 2 3\n")); err == nil {
+		t.Error("short cpu line must error")
+	}
+	if _, err := ParseCPU([]byte("intr 0 0 0\n")); err == nil {
+		t.Error("missing aggregate cpu line must error")
+	}
+	if _, err := ParseMemPercent([]byte("MemTotal: 1000 kB\n")); err == nil {
+		t.Error("meminfo without MemAvailable must error")
+	}
+	if _, _, err := ParseSwapPercent([]byte("SwapTotal: abc kB\n")); err == nil {
+		t.Error("non-numeric SwapTotal must error")
+	}
+	if _, err := ParseLoad1([]byte("")); err == nil {
+		t.Error("empty loadavg must error")
+	}
+	if _, err := ParseLoad1([]byte("not-a-number 0.2 0.3")); err == nil {
+		t.Error("garbage load1 must error")
+	}
+}

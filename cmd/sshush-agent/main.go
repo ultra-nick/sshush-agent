@@ -76,8 +76,10 @@ const (
 
 	// minIntervalS is 20 so the app can offer a 1-MINUTE unreachable threshold.
 	// The arithmetic that ties them: the backend sees silence, not a timer, so
-	// tolerating one lost beat needs 2*(interval*1.1) + timeout <= threshold.
-	// At interval 20 with its derived 5s timeout that is 49s, inside 60s with
+	// tolerating one lost beat needs 2*(interval*1.1) + 2*timeout <= threshold
+	// (two timeout terms: the backend stamps last_seen during handling, and a
+	// successful beat can run to its full timeout after the stamp). At
+	// interval 20 with its derived 5s timeout that is 54s, inside 60s with
 	// room to spare. Do not lower this without redoing that sum - and note the
 	// app derives interval FROM the chosen threshold, so the two stay in step.
 	minIntervalS = 20
@@ -180,6 +182,25 @@ const validMetricList = "cpu|mem|swap|disk|load|temp|interfaceDown"
 // For every other metric the label is carried but ignored.
 var labelRequired = map[string]bool{"disk": true, "interfaceDown": true}
 
+// maxRules mirrors the backend's store.MaxAlertRules. Without it, a
+// hand-edited file with more rules validated cleanly - and then EVERY breach
+// request carried >64 rule_ids and was 422ed and dropped, forever, while
+// beats stayed healthy: a green monitor that could never alert. Same mirror
+// pattern as maxLabelBytes: a loud reload-time failure beats a silent 4xx on
+// every future report.
+const maxRules = 64
+
+// maxDurationS mirrors interval_s's overflow ceiling (decision 8): a
+// duration_s >= ~9.2e9 overflowed the nanosecond conversion to a NEGATIVE
+// Duration and made the rule fire on its FIRST breaching sample - inverting
+// slow-to-alarm. A day is far beyond any legitimate duration.
+const maxDurationS = 86400
+
+// maxThresholdMagnitude mirrors the backend's validateEvent bound (+-1e6): a
+// larger hand-edited threshold rode the rule's first-determination event,
+// 400ed the whole batch, and dropped every co-batched real transition.
+const maxThresholdMagnitude = 1e6
+
 // maxLabelBytes mirrors the backend's cap. Enforcing it here turns a
 // too-long label into a loud startup failure instead of a silent 400 on
 // every future breach report.
@@ -225,9 +246,17 @@ func main() {
 		os.Exit(1)
 	}
 
+	// BOTH endpoints: checkEndpoint validates both, so the warning must cover
+	// both - a mixed config (https beats, http breaches) used to ship the
+	// secret unencrypted on every breach report with no journal line at all,
+	// against decision 10's loud-explicit-choice intent.
 	if strings.HasPrefix(id.Endpoint, "http:") {
 		log.Warn("--insecure: the beat secret crosses the network unencrypted",
 			"endpoint", id.Endpoint)
+	}
+	if strings.HasPrefix(id.BreachEndpoint, "http:") {
+		log.Warn("--insecure: the breach-report secret crosses the network unencrypted",
+			"breach_endpoint", id.BreachEndpoint)
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
@@ -236,15 +265,21 @@ func main() {
 	// The BEAT client has no client-wide Timeout: each beat derives its own
 	// per-request timeout from the interval in force when it is sent (see
 	// beatTimeoutFor).
-	client := &http.Client{}
-	// Breach reports and token posts get a separate, PLAINLY BOUNDED client.
+	// Neither client may follow redirects: Go's default policy re-POSTs the
+	// full body - agent_id AND secret - on a 307/308 to whatever URL the
+	// Location header names (bypassing checkEndpoint's scheme validation),
+	// and quietly converts other 3xx to bodyless GETs. A 3xx is just another
+	// ignored outcome (decision 1: no reaction to responses).
+	noRedirect := func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	client := &http.Client{CheckRedirect: noRedirect}
+	// Breach reports get a separate, PLAINLY BOUNDED client.
 	// They run on the sample goroutine - the only caller of the rule engine,
 	// the rules.json watcher, and the reporter - so a single hung connection
 	// (a peer that completes TLS but never sends headers) would freeze all
 	// monitoring while the separately-bounded beat kept the agent looking
 	// healthy. That exact hole shipped when the old client-wide timeout was
 	// removed and only the beat path got a replacement.
-	reportClient := &http.Client{Timeout: reportTimeout}
+	reportClient := &http.Client{Timeout: reportTimeout, CheckRedirect: noRedirect}
 
 	// The beat interval and the reported unreachable_after_s both live in
 	// shared atomic state because a rules-file reload on the sample goroutine
@@ -271,6 +306,7 @@ func main() {
 	watcher := &ruleWatcher{
 		path: rulesPath, log: log, engine: engine, collector: collector,
 		interval: &intervalNanos, unreachable: &unreachableS,
+		reporter: reporter,
 	}
 	watcher.check(true) // startup load: applies rules.json if present, else no rules
 
@@ -302,18 +338,26 @@ func main() {
 	// backend's restart detection (uptime regression) expects of a healthy
 	// process - a burst can never read as a crash loop.
 	procStart := time.Now()
+	// The burst WINDOW is captured once, before the goroutine starts, and
+	// capped: gating on the CURRENT interval each tick meant a large interval
+	// already in rules.json at startup ran the 10s burst for its whole span
+	// (interval_s=86400 -> a day of fast beats). One interval covers the
+	// enrolment race the burst exists for; 90s is ample headroom over every
+	// app-derived interval (capped at 60s).
+	burstWindow := time.Duration(intervalNanos.Load())
+	if burstWindow > 90*time.Second {
+		burstWindow = 90 * time.Second
+	}
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		// The burst LATCHES off: comparing process age against the current
-		// interval each tick re-entered the burst when a rules reload raised
-		// interval_s mid-first-interval (age 35s < new 60s), and with a large
-		// hand-edited interval would have kept 10s beats going for its whole
-		// span. One flag, flipped once, single-goroutine.
+		// The burst LATCHES off: re-checking process age after the window has
+		// passed must never re-enter the burst (a reload could otherwise
+		// bounce the cadence). One flag, flipped once, single-goroutine.
 		burstOver := false
 		runTickLoop(ctx, func() time.Duration {
 			if !burstOver {
-				if time.Since(procStart) < time.Duration(intervalNanos.Load()) {
+				if time.Since(procStart) < burstWindow {
 					return jitter(burstInterval)
 				}
 				burstOver = true
@@ -360,10 +404,23 @@ type ruleWatcher struct {
 	collector   *metrics.Collector
 	interval    *atomic.Int64 // nanoseconds, read by the beat loop
 	unreachable *atomic.Int64 // seconds, read by the beat loop and reported on every beat
+	// reporter receives an events-empty reconcile when a reload REMOVES
+	// rules, so the backend prunes their alert_state rows without waiting for
+	// some other rule's transition. nil (tests, no breach endpoint) skips it.
+	reporter *report.Reporter
 
 	lastMtime time.Time
+	lastSize  int64
 	present   bool
 }
+
+// maxRulesFileBytes caps the settings file read. The app's largest legitimate
+// file is a few KB; without a cap, a multi-GB rules.json (an accident - the
+// state dir is user-writable) was read whole, OOM-killed the process BEFORE
+// its first beat, and Restart=on-failure crash-looped it indefinitely: beats
+// stopped and the backend raised a false absence, breaking the contract that
+// a broken rules.json is never fatal.
+const maxRulesFileBytes = 1 << 20 // 1 MiB
 
 // check stats the settings file and, on an mtime change, re-reads it. The
 // three rules that matter most:
@@ -387,14 +444,30 @@ func (w *ruleWatcher) check(startup bool) {
 		w.present = false
 		return
 	}
-	if w.present && info.ModTime().Equal(w.lastMtime) {
+	// Change key is (mtime, size), not mtime alone: on coarse-timestamp
+	// filesystems (NFSv3/ext3 at 1s granularity) two temp+rename deliveries
+	// inside one granule left disk holding v2 while the agent evaluated v1 -
+	// silently, for ever. Size catches near-all same-granule replacements; a
+	// same-size same-granule replace remains the accepted residual.
+	if w.present && info.ModTime().Equal(w.lastMtime) && info.Size() == w.lastSize {
 		return // unchanged since the last read
+	}
+	// An oversized file is refused BEFORE the read (see maxRulesFileBytes),
+	// with the standard keep-previous behaviour and one warning per version.
+	if info.Size() > maxRulesFileBytes {
+		w.log.Warn("rules file ignored; keeping the rules already in force",
+			"path", w.path, "size_bytes", info.Size(), "max_bytes", int64(maxRulesFileBytes))
+		w.lastMtime = info.ModTime()
+		w.lastSize = info.Size()
+		w.present = true
+		return
 	}
 	// Record the version we are about to read BEFORE parsing, so a file that
 	// fails to parse is not re-read (and re-warned) every tick - only when it
 	// changes again, e.g. when the user fixes it.
 	w.present = true
 	w.lastMtime = info.ModTime()
+	w.lastSize = info.Size()
 
 	s, perr := loadRulesFile(w.path)
 	if perr != nil {
@@ -408,7 +481,29 @@ func (w *ruleWatcher) check(startup bool) {
 
 	w.interval.Store(int64(time.Duration(s.intervalS) * time.Second))
 	w.unreachable.Store(int64(s.unreachableAfterS))
+	// Detect REMOVED rules before the swap: their prune signal must travel
+	// even if no remaining rule ever transitions again (see EnqueueReconcile).
+	removed := false
+	if w.reporter != nil {
+		newIDs := make(map[string]bool, len(s.rules))
+		for _, r := range s.rules {
+			newIDs[r.ID] = true
+		}
+		for _, r := range w.engine.Rules() {
+			if !newIDs[r.ID] {
+				removed = true
+				break
+			}
+		}
+	}
 	w.engine.UpdateRules(s.rules)
+	if removed {
+		ids := make([]string, 0, len(s.rules))
+		for _, r := range s.rules {
+			ids = append(ids, r.ID)
+		}
+		w.reporter.EnqueueReconcile(ids)
+	}
 	w.warnUnevaluable(s.rules)
 	if s.unreachableDefaulted {
 		w.log.Warn("rules file has no unreachable_after_s; using the default",
@@ -420,7 +515,13 @@ func (w *ruleWatcher) check(startup bool) {
 	// refusing would strand the previous settings for ever), but the journal
 	// says plainly what the combination will do.
 	interval := time.Duration(s.intervalS) * time.Second
-	worst := 2*time.Duration(float64(interval)*1.1) + beatTimeoutFor(interval)
+	// TWO timeout terms: the backend stamps last_seen during handling, and a
+	// successful beat's request can itself run to the full derived timeout
+	// after the stamp - so the true worst one-lost-beat silence is
+	// 2*(interval*1.1) + 2*timeout, not one. The app-offered pairs all stay
+	// safe under the corrected sum; this only affects whether hand-edited
+	// pairs warn.
+	worst := 2*time.Duration(float64(interval)*1.1) + 2*beatTimeoutFor(interval)
 	if worst >= time.Duration(s.unreachableAfterS)*time.Second {
 		w.log.Warn("interval_s is too slow for unreachable_after_s: a single lost beat can be reported as an outage",
 			"interval_s", s.intervalS, "unreachable_after_s", s.unreachableAfterS,
@@ -699,6 +800,9 @@ func validateRules(rs []ruleConfig) []string {
 	bad := func(i int, r ruleConfig, msg string) {
 		problems = append(problems, fmt.Sprintf("rules[%d] (rule_id %q): %s", i, r.RuleID, msg))
 	}
+	if len(rs) > maxRules {
+		problems = append(problems, fmt.Sprintf("%d rules, max %d (the backend's cap - more would poison every breach report)", len(rs), maxRules))
+	}
 	seen := make(map[string]bool)
 	for i, r := range rs {
 		if !validUUID(r.RuleID) {
@@ -718,9 +822,11 @@ func validateRules(rs []ruleConfig) []string {
 		// metric's threshold must be a real number.
 		if r.Metric != "interfaceDown" && (math.IsNaN(r.Threshold) || math.IsInf(r.Threshold, 0)) {
 			bad(i, r, "threshold is not a finite number")
+		} else if r.Metric != "interfaceDown" && (r.Threshold < -maxThresholdMagnitude || r.Threshold > maxThresholdMagnitude) {
+			bad(i, r, fmt.Sprintf("threshold magnitude exceeds %g (the backend's bound)", float64(maxThresholdMagnitude)))
 		}
-		if r.DurationS < 0 {
-			bad(i, r, fmt.Sprintf("duration_s must be >= 0, got %d", r.DurationS))
+		if r.DurationS < 0 || r.DurationS > maxDurationS {
+			bad(i, r, fmt.Sprintf("duration_s must be in [0, %d], got %d", maxDurationS, r.DurationS))
 		}
 		if labelRequired[r.Metric] && r.Label == "" {
 			bad(i, r, fmt.Sprintf("label is required for metric %q (mount point or interface name)", r.Metric))

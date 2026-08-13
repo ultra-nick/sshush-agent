@@ -193,6 +193,22 @@ func (c *Collector) sampleDisk(mount string) (float64, bool) {
 		// resetting the duration timer.
 		return 0, false
 	}
+	return DiskPercent(blocks, bfree, bavail)
+}
+
+// DiskPercent computes df's used percentage from raw statfs numbers.
+//
+// Inconsistent statfs (bfree or bavail exceeding blocks - driver- or
+// FUSE-supplied numbers are not guaranteed coherent) is NO INFORMATION,
+// exactly like CPUPercent's regression guard: without this, the uint64
+// subtraction below wrapped to ~1.8e19, dominated the denominator, and
+// returned a "valid" ~100% sample - a false disk page that then LATCHED,
+// because clear needs one below-threshold sample that never arrives while
+// the inconsistency persists.
+func DiskPercent(blocks, bfree, bavail uint64) (float64, bool) {
+	if bfree > blocks || bavail > blocks {
+		return 0, false
+	}
 	// df's formula: used never counts the root-reserved blocks as available,
 	// so the percentage matches what an operator sees in df output.
 	used := float64(blocks - bfree)
@@ -246,7 +262,12 @@ func (c *Collector) statfsBounded(mount string) (blocks, bfree, bavail uint64, o
 }
 
 func (c *Collector) sampleTemp() (float64, bool) {
-	best := -1.0
+	// Presence is tracked EXPLICITLY, not via a sentinel: the old best=-1.0
+	// scheme conflated "no sensor" with "hottest zone below 0 C", so an
+	// outdoor Pi in winter silently produced no samples (and the sensorless-
+	// hardware startup warning fired on working-but-cold hardware).
+	found := false
+	best := 0.0
 	for _, zone := range c.zones() {
 		data, err := c.readFile(zone)
 		if err != nil {
@@ -256,11 +277,22 @@ func (c *Collector) sampleTemp() (float64, bool) {
 		if err != nil {
 			continue
 		}
-		if v := float64(milli) / 1000; v > best {
+		v := float64(milli) / 1000
+		// A reading outside any physically plausible range is a broken zone,
+		// and NO INFORMATION (decision 6) - never a sample. Without this, one
+		// flaky sensor reporting INT_MAX millidegrees produced a "valid"
+		// ~2,147,483 C reading that breached the temp rule AND, exceeding the
+		// backend's +-1e6 value bound, 400ed the whole breach batch - dropping
+		// every co-batched legitimate alert, permanently.
+		if v < -50 || v > 250 {
+			continue
+		}
+		if !found || v > best {
 			best = v
+			found = true
 		}
 	}
-	if best < 0 {
+	if !found {
 		// Absent sensor is not an error; the rule is simply never evaluated.
 		return 0, false
 	}
@@ -337,17 +369,24 @@ func ParseCPU(data []byte) (CPUCounters, error) {
 
 // CPUPercent computes percent busy across the interval between two readings.
 //
-// BOTH counters are guarded against regression, symmetrically. Busy includes
-// steal, and hypervisors can regress the steal counter across a live
-// migration (observed on KVM cloud hosts); a Busy regression small enough to
-// leave Total climbing would otherwise wrap the uint64 subtraction to ~1.8e19
-// and report a quintillion-percent CPU sample as valid.
+// THREE guards. Busy includes steal, and hypervisors can regress the steal
+// counter across a live migration (observed on KVM cloud hosts); a Busy
+// regression small enough to leave Total climbing would otherwise wrap the
+// uint64 subtraction to ~1.8e19 and report a quintillion-percent CPU sample
+// as valid. The third guard is the invariant that actually matters:
+// dBusy <= dTotal. iowait is in Total but not Busy and proc(5) documents it
+// as non-monotonic on SMP, so a partial iowait regression that leaves Total
+// climbing can shrink dTotal below dBusy and yield >100% "valid" samples -
+// inconsistent interval accounting is NO INFORMATION.
 func CPUPercent(prev, cur CPUCounters) (float64, bool) {
 	if cur.Total <= prev.Total || cur.Busy < prev.Busy {
 		return 0, false
 	}
 	dBusy := float64(cur.Busy - prev.Busy)
 	dTotal := float64(cur.Total - prev.Total)
+	if dBusy > dTotal {
+		return 0, false
+	}
 	return dBusy / dTotal * 100, true
 }
 

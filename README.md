@@ -21,8 +21,10 @@ The agent does four things, and nothing else:
 4. **Breach reports.** When a rule changes state, it POSTs that one transition to
    `breach_endpoint`.
 
-Metrics are read and rules are evaluated entirely on the server; only a crossed threshold is ever
-sent, never the underlying numbers. Beyond those outbound POSTs the agent **never listens on any
+Metrics are read and rules are evaluated entirely on the server; only rule TRANSITIONS are ever
+sent - each carrying the single reading that crossed and the configured threshold, so the alert
+can say "cpu at 95 (threshold 90)" - never a stream or history of raw metrics. Beyond those
+outbound POSTs the agent **never listens on any
 port, executes a remote command, or fetches anything** - its whole network footprint is the two
 endpoints you can read in `/etc/sshush/config.json`. An agent with no rules configured simply
 beats; metrics sampling and breach reporting switch on only when rules are present.

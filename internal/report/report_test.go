@@ -359,3 +359,29 @@ func TestSeqPersistsAcrossRestart(t *testing.T) {
 		t.Errorf("post-restart seq = %d, want 9001 (stored mark + 1, not the regressed clock)", got)
 	}
 }
+
+// A reconcile (rule removal with nothing else to say) freezes an events-EMPTY
+// request that still carries rule_ids - "events":[] on the wire, never null,
+// so the backend's reconcile branch (empty events + rule_ids present) matches.
+func TestEnqueueReconcileFreezesEmptyEvents(t *testing.T) {
+	clock := time.Unix(5000, 0)
+	r := newTestReporter("http://unused.invalid", &clock)
+
+	r.EnqueueReconcile([]string{"6ba7b810-9dad-11d1-80b4-00c04fd430c8"})
+	if r.Pending() != 1 {
+		t.Fatalf("pending = %d, want the reconcile queued", r.Pending())
+	}
+	var wire struct {
+		Events  []json.RawMessage `json:"events"`
+		RuleIDs []string          `json:"rule_ids"`
+	}
+	if err := json.Unmarshal(r.queue[0].body, &wire); err != nil {
+		t.Fatalf("frozen body not json: %v", err)
+	}
+	if wire.Events == nil || len(wire.Events) != 0 {
+		t.Fatalf("events = %v, want present-and-empty", wire.Events)
+	}
+	if len(wire.RuleIDs) != 1 {
+		t.Fatalf("rule_ids = %v, want the current set", wire.RuleIDs)
+	}
+}

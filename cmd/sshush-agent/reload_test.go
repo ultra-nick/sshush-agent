@@ -358,7 +358,8 @@ func TestOneLostBeatFitsInsideItsThreshold(t *testing.T) {
 		{60, 180}, // 3 minutes (and the agent default)
 	} {
 		interval := time.Duration(tc.intervalS) * time.Second
-		worst := 2*time.Duration(float64(interval)*1.1) + beatTimeoutFor(interval)
+		// Two timeout terms - see the reload-time warning's formula.
+		worst := 2*time.Duration(float64(interval)*1.1) + 2*beatTimeoutFor(interval)
 		threshold := time.Duration(tc.thresholdS) * time.Second
 		if worst >= threshold {
 			t.Errorf("interval %ds: one lost beat spans %v, which does NOT fit inside a %v threshold",

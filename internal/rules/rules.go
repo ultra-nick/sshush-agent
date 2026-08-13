@@ -70,7 +70,22 @@ type ruleState struct {
 	// aboveSince is when the value first went above threshold in the
 	// current excursion; zero when at or below.
 	aboveSince time.Time
+	// blindSince marks the start of the CURRENT unreadable stretch (zero =
+	// the last evaluation had information). It bounds how much blind time an
+	// excursion may credit (see maxBlindGap): aboveSince anchors to the wall
+	// clock, so without a bound one breaching sample, an hours-long
+	// unreadable stretch (a hung NFS mount), and one recovery-edge sample
+	// would fire a "sustained" breach observed for only two ticks.
+	blindSince time.Time
 }
+
+// maxBlindGap is the longest unreadable stretch an in-flight excursion may
+// absorb before its timer restarts on the next reading. Short gaps (a couple
+// of missed ticks) stay credited - decision 6's test pins a 30s blind step
+// counting toward the duration - but a gap this long means nobody measured
+// anything for most of the window, and "sustained" would be a claim about
+// time the agent never observed.
+const maxBlindGap = 60 * time.Second
 
 // New builds an engine. Every rule starts unreported with no excursion.
 func New(rules []Rule, now func() time.Time) *Engine {
@@ -133,12 +148,50 @@ func (e *Engine) Evaluate(sample Sampler) []Event {
 	var events []Event
 	now := e.now()
 
+	// One reading per distinct (metric, label) per tick, shared by every rule
+	// on that metric. Delta-based samplers (cpu) keep previous-reading state
+	// and are NOT idempotent within a tick: two cpu rules each calling the
+	// sampler gave the first a proper ~10s window and the second a
+	// microseconds window that the regression guard rejected almost every
+	// tick - so the second rule silently never evaluated, never advanced its
+	// duration, and never emitted its first determination. Memoizing also
+	// makes multi-rule evaluation self-consistent: every rule on a metric
+	// judges the SAME number.
+	type sampled struct {
+		v  float64
+		ok bool
+	}
+	memo := make(map[[2]string]sampled, len(e.rules))
+	sampleOnce := func(metric, label string) (float64, bool) {
+		key := [2]string{metric, label}
+		if m, done := memo[key]; done {
+			return m.v, m.ok
+		}
+		v, ok := sample(metric, label)
+		memo[key] = sampled{v, ok}
+		return v, ok
+	}
+
 	for _, r := range e.rules {
 		s := e.state[r.ID]
-		v, ok := sample(r.Metric, r.Label)
+		v, ok := sampleOnce(r.Metric, r.Label)
 		if !ok {
+			// Record when this blind stretch began (first unreadable tick
+			// after information), then leave everything else untouched.
+			if s.blindSince.IsZero() {
+				s.blindSince = now
+			}
 			continue
 		}
+		// Information again after a LONG blind stretch: invalidate the
+		// in-flight excursion timer rather than crediting the unobserved
+		// span (decision 6 - bounded crediting; see maxBlindGap). Short
+		// stretches stay credited exactly as before.
+		if !s.aboveSince.IsZero() && !s.blindSince.IsZero() &&
+			now.Sub(s.blindSince) > maxBlindGap {
+			s.aboveSince = time.Time{}
+		}
+		s.blindSince = time.Time{}
 
 		if r.breaching(v) {
 			// Slow to alarm: the value must stay in breach for the full

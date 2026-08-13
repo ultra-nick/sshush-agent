@@ -1,8 +1,15 @@
 package main
 
 import (
+	"io"
+	"log/slog"
+	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
+
+	"github.com/ultra-nick/sshush-agent/internal/rules"
 )
 
 const goodRule = "6ba7b810-9dad-11d1-80b4-00c04fd430c8"
@@ -36,6 +43,10 @@ func TestValidateRules(t *testing.T) {
 			extra:    []ruleConfig{{RuleID: goodRule, Metric: "mem", Threshold: 80}},
 			wantHint: "duplicate rule_id",
 		},
+		// The backend mirrors (audit round): each turns a silent 4xx-and-drop
+		// on every future report into a loud reload-time refusal.
+		{name: "duration overflow", mutate: func(r *ruleConfig) { r.DurationS = 10_000_000_000 }, wantHint: "duration_s"},
+		{name: "threshold past backend bound", mutate: func(r *ruleConfig) { r.Threshold = 2e6 }, wantHint: "backend's bound"},
 	}
 
 	for _, tc := range tests {
@@ -73,5 +84,31 @@ func TestValidateRulesReportsAllProblems(t *testing.T) {
 	})
 	if len(problems) != 2 {
 		t.Fatalf("problems = %d, want 2 (all reported at once): %v", len(problems), problems)
+	}
+}
+
+// An oversized rules.json must be refused BEFORE the read (keep-previous, one
+// warning) - reading it whole used to OOM-kill the process pre-beat into an
+// indefinite crash loop and a false absence alert.
+func TestOversizedRulesFileIsRefused(t *testing.T) {
+	dir := t.TempDir()
+	path := dir + "/rules.json"
+	big := make([]byte, maxRulesFileBytes+1)
+	if err := os.WriteFile(path, big, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	var intervalNanos, unreachable atomic.Int64
+	intervalNanos.Store(int64(60 * time.Second))
+	w := &ruleWatcher{
+		path: path, log: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		engine:   rules.New(nil, time.Now),
+		interval: &intervalNanos, unreachable: &unreachable,
+	}
+	w.check(true)
+	if got := len(w.engine.Rules()); got != 0 {
+		t.Fatalf("rules loaded from an oversized file: %d", got)
+	}
+	if !w.present {
+		t.Fatal("the oversized file must be recorded as seen (no re-warn every tick)")
 	}
 }
