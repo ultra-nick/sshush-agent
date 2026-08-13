@@ -1,6 +1,6 @@
 // Command sshush-agent is the SSHush server-side agent.
 //
-// Its configuration is split across three files so that rules can be edited
+// Its configuration is split across two files so that rules can be edited
 // without root:
 //
 //	/etc/sshush/config.json    root:sshush 0640   the IDENTITY: agent_id,
@@ -12,11 +12,6 @@
 //	                                               rules[]. Owned by the user
 //	                                               who ran the install, re-read
 //	                                               on change, and never fatal.
-//	/var/lib/sshush/device_token (same owner)      the phone's APNs token, in
-//	                                               its OWN file so the token
-//	                                               writer never rewrites rules
-//	                                               content. Re-read on change;
-//	                                               absent is fine.
 //
 // Credentials need root; settings do not. That split is the whole point: on a
 // server where sudo needs a password, root exists only during the interactive
@@ -64,10 +59,6 @@ import (
 const (
 	configPath = "/etc/sshush/config.json"
 	rulesPath  = "/var/lib/sshush/rules.json"
-	// deviceTokenPath is the app-written token file, deliberately SEPARATE
-	// from rules.json so the token writer never rewrites rules content (see
-	// devicetoken.go for the file format and why).
-	deviceTokenPath = "/var/lib/sshush/device_token"
 
 	// maxBeatTimeout bounds one POST at the slowest cadence. The ACTUAL timeout
 	// is derived per interval (see beatTimeoutFor): it is always at most a
@@ -102,7 +93,7 @@ const (
 	// lands within seconds of the backend's snapshot learning the agent.
 	burstInterval = 10 * time.Second
 
-	// reportTimeout bounds one breach-report or device-token POST. These run
+	// reportTimeout bounds one breach-report POST. These run
 	// on the sample goroutine (10s ticks), so the bound must exist - an
 	// unbounded hang freezes all rule evaluation - but need not be tight:
 	// the reporter stops at the first retryable failure, so a down backend
@@ -155,10 +146,10 @@ type rulesFileJSON struct {
 	Rules             []ruleConfig `json:"rules"`
 }
 
-// ruleSettings is one successfully loaded settings file. The device token is
-// NOT here: it lives in its own file (see devicetoken.go) so the app's token
-// writer never has to rewrite rules content. A device_token field left in an
-// old rules.json is silently ignored (unknown fields are tolerated).
+// ruleSettings is one successfully loaded settings file. A device_token field
+// left in a rules.json written by an old app build is silently ignored
+// (unknown fields are tolerated); tokens are the backend's business now, per
+// device, and never pass through this server.
 type ruleSettings struct {
 	intervalS            int
 	unreachableAfterS    int
@@ -277,23 +268,11 @@ func main() {
 	}
 	sample := collector.Sample
 
-	// The device-token relay reports the phone's APNs token to /v1/device-token
-	// (agent_id + secret auth, like the breach path) whenever the app changes it
-	// in rules.json - on change only, never on every reload.
-	relay, err := newTokenRelay(id.Endpoint, id.AgentID, id.Secret, reportClient, log)
-	if err != nil {
-		// The endpoint already parsed as a URL at identity load, so this is not
-		// expected; disable the relay rather than take the agent down over it.
-		log.Error("device-token relay disabled: cannot derive endpoint", "error", err.Error())
-	}
-
 	watcher := &ruleWatcher{
 		path: rulesPath, log: log, engine: engine, collector: collector,
 		interval: &intervalNanos, unreachable: &unreachableS,
 	}
 	watcher.check(true) // startup load: applies rules.json if present, else no rules
-	tokenWatcher := &tokenFileWatcher{path: deviceTokenPath, log: log, relay: relay}
-	tokenWatcher.check() // startup load: picks up a token written while stopped
 
 	log.Info("sshush-agent starting",
 		"agent_id", id.AgentID, "endpoint", id.Endpoint,
@@ -361,14 +340,7 @@ func main() {
 		defer wg.Done()
 		runTickLoop(ctx, func() time.Duration { return sampleInterval }, func() {
 			watcher.check(false)
-			tokenWatcher.check()
 			evaluateAndReport(ctx, engine, sample, reporter, log)
-			// Relay the device token if it changed. flush runs every tick (not
-			// mtime-gated) so a failed post is retried next tick with the same
-			// value; a no-op when nothing changed.
-			if relay != nil {
-				relay.flush(ctx)
-			}
 		})
 	}()
 

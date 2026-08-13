@@ -21,17 +21,13 @@ The agent does four things, and nothing else:
 4. **Breach reports.** When a rule changes state, it POSTs that one transition to
    `breach_endpoint`.
 
-It also relays one value it does not otherwise use: the phone's push-notification token, when
-the app writes one to `/var/lib/sshush/device_token` (see below). The agent holds the secret, so
-it is what tells the backend where alerts should go.
-
 Metrics are read and rules are evaluated entirely on the server; only a crossed threshold is ever
 sent, never the underlying numbers. Beyond those outbound POSTs the agent **never listens on any
 port, executes a remote command, or fetches anything** - its whole network footprint is the two
 endpoints you can read in `/etc/sshush/config.json`. An agent with no rules configured simply
 beats; metrics sampling and breach reporting switch on only when rules are present.
 
-### Configuration is split across three files
+### Configuration is split across two files
 
 Credentials need root; settings do not. That split is the whole point: on a server where `sudo`
 needs a password, root exists only during the interactive install, so editing rules afterwards
@@ -76,10 +72,9 @@ long of silence the backend should treat as this server being down; the agent do
 it, it only reports it on every beat. A settings file whose `interval_s` is too slow to survive
 one lost beat within `unreachable_after_s` is applied but logs a warning.
 
-**3. The push token**, `/var/lib/sshush/device_token` (same owner) - plain text, re-read on
-change. A 64-character hex token is relayed to the backend; an empty file means "clear it"; no
-file at all means nothing to say. It lives apart from the rules so that writing a token can
-never rewrite your rules, and vice versa.
+Where alert notifications go is none of this agent's business: each phone or tablet registers
+its own push token directly with the backend over HTTPS. No token ever touches this server, and
+a `device_token` field left in a `rules.json` written by an old app version is ignored.
 
 Both endpoints must be `https://`. The agent refuses to start with a plain-http endpoint unless
 `--insecure` is passed explicitly, because the secret would cross the network unencrypted - that
@@ -138,19 +133,16 @@ overwrites every managed file, and starts them again.
 | `/etc/sshush/config.json` (when shipped) | `root:sshush` | `0640` |
 | `/var/lib/sshush/` | `<installing user>:sshush` | `0770` |
 | `/var/lib/sshush/rules.json` | `<installing user>:sshush` | `0644` |
-| `/var/lib/sshush/device_token`* | `<installing user>:sshush` | `0644` |
 
-\*`device_token` is not written by the installer - it appears only if and when the app relays a
-push token (same owner and mode). The installer creates `rules.json` (empty) and, when a
-`config.json` is shipped alongside, installs that.
+The installer creates `rules.json` (empty) and, when a `config.json` is shipped alongside,
+installs that.
 
 It also creates a system user `sshush` with a `nologin` shell and no home directory.
 
 The state directory is owned by the user who ran the install, with the agent's group, so that
 user can edit rules afterwards WITHOUT root - that is the whole reason the configuration is
 split. If that matters to you, note what it means: anyone who can act as that user can change
-what this agent alerts on, and can hand it a push token. The credentials in `/etc/sshush` stay
-root-only either way.
+what this agent alerts on. The credentials in `/etc/sshush` stay root-only either way.
 
 Nothing else on your system is touched. There is no package manager integration, no cron entry,
 and no modification of any existing file.
