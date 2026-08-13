@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -76,6 +77,26 @@ func newTestReporter(url string, clock *time.Time) *Reporter {
 		slog.New(slog.NewTextHandler(io.Discard, nil)), "")
 	r.now = func() time.Time { return *clock }
 	return r
+}
+
+// The adopted high-water is clamped to plausibility: MaxInt64 from a hostile
+// or corrupt backend would wrap the next increment negative and persist the
+// garbage; non-positive values are noise. Plausible values still adopt.
+func TestAdoptSeqClampsImplausible(t *testing.T) {
+	clock := time.Unix(5000, 0)
+	r := newTestReporter("http://unused.invalid", &clock)
+	r.lastSeq = 5000
+
+	r.adoptSeq(math.MaxInt64)
+	r.adoptSeq(-3)
+	r.adoptSeq(0)
+	if r.lastSeq != 5000 {
+		t.Fatalf("implausible backend seq adopted: lastSeq = %d", r.lastSeq)
+	}
+	r.adoptSeq(6000)
+	if r.lastSeq != 6000 {
+		t.Fatalf("plausible backend seq not adopted: lastSeq = %d", r.lastSeq)
+	}
 }
 
 func TestSeqStrictlyIncreasing(t *testing.T) {

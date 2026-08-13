@@ -109,6 +109,12 @@ fi
 # watcher could fire mid-install. Both are stopped before anything is written.
 # Absent units are not an error here.
 systemctl stop sshush-uninstall.path >/dev/null 2>&1 || :
+# The oneshot service too: stopping the path unit does not stop a service it
+# ALREADY started, and an in-flight uninstall's removals would interleave with
+# the writes below. Killing it mid-run is safe - the uninstall script is
+# documented as finishable by re-running, and this install overwrites every
+# managed file anyway.
+systemctl stop sshush-uninstall.service >/dev/null 2>&1 || :
 systemctl stop sshush-agent.service >/dev/null 2>&1 || :
 
 # ---------------------------------------------------------------- install
@@ -133,7 +139,10 @@ install -o root -g root -m 0644 "$SCRIPT_DIR/sshush-uninstall.service" "$UNIT_DI
 # is correct. This is the one moment root exists in every case (including the
 # password-sudo terminal handoff), so the settings file's ownership is fixed
 # here, at install time, to a user who can then edit it forever without root.
-OWNER="${SUDO_USER:-$(id -un)}"
+# doas sets DOAS_USER instead of SUDO_USER - and the refusal message above
+# offers doas as a first-class route, so honour it: falling through to root
+# ownership would silently defeat the rules-without-root design.
+OWNER="${SUDO_USER:-${DOAS_USER:-$(id -un)}}"
 
 # install -d resets mode and ownership on a directory that already exists, so a
 # re-run repairs drift rather than leaving a previous cycle's permissions.

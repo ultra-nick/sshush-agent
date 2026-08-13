@@ -111,6 +111,23 @@ func TestParseSwapPercentNoSwap(t *testing.T) {
 	}
 }
 
+// Incoherent meminfo numbers are no information, not a negative percent: a
+// below-threshold sample mid-breach would fire a false one-sample clear.
+// Mirrors TestDiskPercentInconsistentStatfsIsNoInformation.
+func TestParseMemPercentInconsistentIsError(t *testing.T) {
+	bad := "MemTotal:        1000 kB\nMemAvailable:    2000 kB\n"
+	if _, err := ParseMemPercent([]byte(bad)); err == nil {
+		t.Fatal("MemAvailable > MemTotal must be an error, not a negative percent")
+	}
+}
+
+func TestParseSwapPercentInconsistentIsError(t *testing.T) {
+	bad := "SwapTotal:       1000 kB\nSwapFree:        2000 kB\n"
+	if _, _, err := ParseSwapPercent([]byte(bad)); err == nil {
+		t.Fatal("SwapFree > SwapTotal must be an error, not a negative percent")
+	}
+}
+
 func TestParseLoad1(t *testing.T) {
 	v, err := ParseLoad1([]byte(procLoadavg))
 	if err != nil {

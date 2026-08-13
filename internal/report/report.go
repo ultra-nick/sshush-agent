@@ -147,7 +147,18 @@ func (r *Reporter) persistSeq() {
 
 // adoptSeq raises the high-water mark to the backend's, from a stale
 // response. The next nextSeq then starts past it.
+//
+// The adopted value is clamped to plausibility - this is the one place a
+// parsed response value feeds arithmetic and persisted state. Legitimate
+// seqs are unix-timestamp-scale (nextSeq starts at now); a hostile or
+// corrupt counterparty sending MaxInt64 would wrap the next increment
+// negative and persist the garbage high-water. Anything non-positive or
+// further than a year past now is ignored: the batch still follows the
+// normal stale path, just without adopting the number.
 func (r *Reporter) adoptSeq(backendSeq int64) {
+	if backendSeq <= 0 || backendSeq > r.now().Unix()+365*24*3600 {
+		return
+	}
 	if backendSeq > r.lastSeq {
 		r.lastSeq = backendSeq
 		r.persistSeq()

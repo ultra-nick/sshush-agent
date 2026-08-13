@@ -246,11 +246,15 @@ func main() {
 	// both - a mixed config (https beats, http breaches) used to ship the
 	// secret unencrypted on every breach report with no journal line at all,
 	// against decision 10's loud-explicit-choice intent.
-	if strings.HasPrefix(id.Endpoint, "http:") {
+	// Judged on the PARSED scheme, exactly as checkEndpoint validates it:
+	// url.Parse lowercases the scheme, so a hand-written "HTTP://..." passes
+	// validation under --insecure and genuinely crosses in plaintext - a raw
+	// prefix test skipped the warning for it.
+	if isPlainHTTP(id.Endpoint) {
 		log.Warn("--insecure: the beat secret crosses the network unencrypted",
 			"endpoint", id.Endpoint)
 	}
-	if strings.HasPrefix(id.BreachEndpoint, "http:") {
+	if isPlainHTTP(id.BreachEndpoint) {
 		log.Warn("--insecure: the breach-report secret crosses the network unencrypted",
 			"breach_endpoint", id.BreachEndpoint)
 	}
@@ -735,9 +739,21 @@ func loadIdentity(insecureOK bool) (identity, error) {
 // defaultUnreachableS and the returned settings flag it so the caller can warn.
 // A present but out-of-range value IS an error, like any malformed field.
 func loadRulesFile(path string) (ruleSettings, error) {
-	raw, err := os.ReadFile(path)
+	// The read itself is bounded, not just the caller's stat: a file swapped
+	// in between the stat and this read would otherwise be read whole. One
+	// byte over the cap is enough to refuse with the same oversized error;
+	// the caller's stat check remains the cheap early refusal.
+	f, err := os.Open(path)
 	if err != nil {
 		return ruleSettings{}, err
+	}
+	defer f.Close()
+	raw, err := io.ReadAll(io.LimitReader(f, maxRulesFileBytes+1))
+	if err != nil {
+		return ruleSettings{}, fmt.Errorf("read %s: %w", path, err)
+	}
+	if len(raw) > maxRulesFileBytes {
+		return ruleSettings{}, fmt.Errorf("%s is over %d bytes; refusing to parse it", path, int64(maxRulesFileBytes))
 	}
 	var rf rulesFileJSON
 	if err := json.Unmarshal(raw, &rf); err != nil {
@@ -782,6 +798,13 @@ func loadRulesFile(path string) (ruleSettings, error) {
 		rules:                out,
 		unreachableDefaulted: defaulted,
 	}, nil
+}
+
+// isPlainHTTP reports whether an already-validated endpoint uses plain http,
+// judged on the parsed (lowercased) scheme like checkEndpoint itself.
+func isPlainHTTP(raw string) bool {
+	u, err := url.Parse(raw)
+	return err == nil && u.Scheme == "http"
 }
 
 func checkEndpoint(name, raw string, insecureOK bool) error {
@@ -847,6 +870,19 @@ func validateRules(rs []ruleConfig) []string {
 		}
 		if len(r.Label) > maxLabelBytes {
 			bad(i, r, fmt.Sprintf("label is %d bytes, max %d", len(r.Label), maxLabelBytes))
+		}
+		// Aggregate-body mirror: the backend also caps the whole breach
+		// request (24 KB), and json.Marshal escapes control characters to
+		// six bytes each - so a file whose labels pass the RAW byte cap
+		// could still freeze a startup re-assertion batch past the body cap,
+		// 413ed and dropped whole on every restart. Control characters are
+		// never legitimate in a mount point or interface name; rejecting
+		// them plus bounding the ESCAPED length keeps the worst legal batch
+		// (64 rules, maximal labels) safely under the backend's cap.
+		if strings.ContainsFunc(r.Label, func(c rune) bool { return c < 0x20 || c == 0x7f }) {
+			bad(i, r, "label contains control characters")
+		} else if esc, _ := json.Marshal(r.Label); len(esc)-2 > maxLabelBytes {
+			bad(i, r, fmt.Sprintf("label is %d bytes JSON-escaped, max %d (quotes and \\u escapes count)", len(esc)-2, maxLabelBytes))
 		}
 	}
 	return problems

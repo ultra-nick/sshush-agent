@@ -37,6 +37,10 @@ func TestValidateRules(t *testing.T) {
 		{name: "disk without label", mutate: func(r *ruleConfig) { r.Metric = "disk" }, wantHint: "label is required"},
 		{name: "interfaceDown without label", mutate: func(r *ruleConfig) { r.Metric = "interfaceDown" }, wantHint: "label is required"},
 		{name: "label too long", mutate: func(r *ruleConfig) { r.Label = strings.Repeat("x", 129) }, wantHint: "max 128"},
+		{name: "label with control characters", mutate: func(r *ruleConfig) { r.Label = "bad\x01label" }, wantHint: "control characters"},
+		// 30 raw bytes but 180 escaped (& -> \u0026): passes the raw cap,
+		// must fail the escaped-length mirror of the backend's body cap.
+		{name: "label too long JSON-escaped", mutate: func(r *ruleConfig) { r.Label = strings.Repeat("&", 30) }, wantHint: "JSON-escaped"},
 		{
 			name:     "duplicate rule_id",
 			mutate:   func(r *ruleConfig) {},

@@ -182,7 +182,17 @@ func (c *Collector) sampleLoad() (float64, bool) {
 	}
 	// Per-core load, so the same threshold means the same thing on a
 	// 1-core VPS and a 16-core box.
-	return v / c.numCPU, true
+	perCore := v / c.numCPU
+	// Plausibility bound, mirroring the temp sampler's: the backend 400s any
+	// event value beyond +-1e6 and a 4xx drops the whole batch, so an
+	// implausible reading must become no-information here rather than poison
+	// co-batched events. Genuine loadavg cannot approach this (millions of
+	// runnable tasks per core); only corrupt input can.
+	if perCore < 0 || perCore > 1e6 {
+		c.log.Debug("metric implausible", "metric", "load", "per_core", perCore)
+		return 0, false
+	}
+	return perCore, true
 }
 
 func (c *Collector) sampleDisk(mount string) (float64, bool) {
@@ -422,6 +432,14 @@ func ParseMemPercent(data []byte) (float64, error) {
 	if !haveTotal || !haveAvail || total <= 0 {
 		return 0, fmt.Errorf("meminfo missing MemTotal or MemAvailable")
 	}
+	if avail > total {
+		// Incoherent kernel numbers are no information, not a reading
+		// (decision 6): a negative percent here is one below-threshold
+		// sample, and decision 7's one-sample clear would fire a false
+		// "back to normal" mid-breach. Same guard as DiskPercent's
+		// bfree > blocks and CPUPercent's regression check.
+		return 0, fmt.Errorf("meminfo inconsistent: MemAvailable %.0f > MemTotal %.0f", avail, total)
+	}
 	return (total - avail) / total * 100, nil
 }
 
@@ -459,6 +477,11 @@ func ParseSwapPercent(data []byte) (float64, bool, error) {
 	}
 	if total == 0 {
 		return 0, false, nil // swap not configured
+	}
+	if free > total {
+		// Same no-information guard as ParseMemPercent: a negative percent
+		// would read as one below-threshold sample and fire a false clear.
+		return 0, false, fmt.Errorf("meminfo inconsistent: SwapFree %.0f > SwapTotal %.0f", free, total)
 	}
 	return (total - free) / total * 100, true, nil
 }

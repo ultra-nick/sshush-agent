@@ -43,8 +43,14 @@ if [ -f "$MARKER" ]; then
 	marker_id=$(head -c 64 "$MARKER" 2>/dev/null | tr -d '[:space:]')
 	if [ -n "$marker_id" ] && [ -f /etc/sshush/config.json ]; then
 		own_id=$(sed -n 's/.*"agent_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/sshush/config.json 2>/dev/null | head -n 1)
-		if [ -n "$own_id" ] && [ "$marker_id" != "$own_id" ]; then
-			step "marker is scoped to a different agent; ignoring it"
+		# A scoped marker whose owner cannot be determined is treated as a
+		# MISMATCH, not a pass: config.json exists but its agent_id did not
+		# parse, so the one thing a scoped request needs - proof it names
+		# THIS install - is missing. Failing open here is exactly the stale-
+		# device scenario the check exists for. A hand-run by an
+		# administrator carries no marker and is unaffected.
+		if [ -z "$own_id" ] || [ "$marker_id" != "$own_id" ]; then
+			step "marker is scoped to a different agent (or this install's id is unreadable); ignoring it"
 			rm -f "$MARKER"
 			exit 0
 		fi
