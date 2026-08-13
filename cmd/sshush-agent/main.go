@@ -309,6 +309,20 @@ func main() {
 		reporter: reporter,
 	}
 	watcher.check(true) // startup load: applies rules.json if present, else no rules
+	// STARTUP RECONCILE, unconditionally (even with zero rules): rules
+	// deleted while the process was DOWN can leave wedged alert_state rows
+	// backend-side, and the removal-triggered reconcile can never fire for
+	// them (the diff base at startup is empty - and with zero rules the agent
+	// would never contact /v1/breach at all). One events-empty request per
+	// process start; the backend prunes + seq-advances, and Invariant I keeps
+	// it silent when nothing actually changed.
+	if reporter != nil {
+		ids := make([]string, 0, len(engine.Rules()))
+		for _, r := range engine.Rules() {
+			ids = append(ids, r.ID)
+		}
+		reporter.EnqueueReconcile(ids)
+	}
 
 	log.Info("sshush-agent starting",
 		"agent_id", id.AgentID, "endpoint", id.Endpoint,
@@ -822,7 +836,11 @@ func validateRules(rs []ruleConfig) []string {
 		// metric's threshold must be a real number.
 		if r.Metric != "interfaceDown" && (math.IsNaN(r.Threshold) || math.IsInf(r.Threshold, 0)) {
 			bad(i, r, "threshold is not a finite number")
-		} else if r.Metric != "interfaceDown" && (r.Threshold < -maxThresholdMagnitude || r.Threshold > maxThresholdMagnitude) {
+		} else if r.Threshold < -maxThresholdMagnitude || r.Threshold > maxThresholdMagnitude {
+			// UNCONDITIONAL, interfaceDown included: its threshold is ignored
+			// by the ENGINE but still rides the wire verbatim, and the
+			// backend's magnitude bound has no carve-out - a huge hand-edited
+			// value 400ed the whole batch, co-batched real events included.
 			bad(i, r, fmt.Sprintf("threshold magnitude exceeds %g (the backend's bound)", float64(maxThresholdMagnitude)))
 		}
 		if r.DurationS < 0 || r.DurationS > maxDurationS {
