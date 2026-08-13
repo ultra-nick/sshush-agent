@@ -6,12 +6,21 @@
 # sshush-uninstall.path when /var/lib/sshush/uninstall appears) or invoked
 # directly by an administrator. Both routes must work.
 #
-# SECURITY: every path below is a hardcoded absolute literal. Nothing is read
-# out of the marker file, and no path, name, or argument is derived from it, from
-# the environment, or from any argument passed to this script. The marker carries
-# exactly one bit of meaning - "the sshush user asked" - so an attacker who fully
-# controls the agent can do nothing worse than uninstall it. If you are editing
-# this script, that property is a requirement, not a stylistic preference.
+# SECURITY: every path below is a hardcoded absolute literal. No path, name, or
+# argument is ever derived from the marker file, the environment, or any
+# argument passed to this script. The marker's CONTENT is used for exactly one
+# thing: an equality comparison against this install's own agent_id (below),
+# which can only make this script do LESS - a mismatch removes the marker and
+# exits without uninstalling. So an attacker who fully controls the agent can
+# still do nothing worse than uninstall it. If you are editing this script,
+# that property is a requirement, not a stylistic preference.
+#
+# THE SCOPE CHECK: a marker may carry the agent_id its teardown was issued
+# for. The app's disable flow can run on a device whose view of this server is
+# STALE (CloudKit-synced state), and an unscoped marker let such a device
+# uninstall a fresh agent another device had just installed - the newer
+# enrolment's backend row then pushed spurious no-heartbeat alerts for ever.
+# Empty marker = unscoped (older app builds): proceed, as always.
 #
 # There is deliberately no `set -e`. Every step has to tolerate its target
 # already being gone, so that a partially-completed previous run can be finished
@@ -24,6 +33,22 @@ step() {
 if [ "$(id -u)" -ne 0 ]; then
 	echo "sshush-uninstall: must run as root (try: sudo /usr/local/bin/sshush-uninstall)" >&2
 	exit 1
+fi
+
+# The scope check runs BEFORE anything is touched. Only applies when the
+# marker exists (a hand-run by an administrator carries no marker and always
+# proceeds). Reads are bounded and the content is never interpolated anywhere.
+MARKER=/var/lib/sshush/uninstall
+if [ -f "$MARKER" ]; then
+	marker_id=$(head -c 64 "$MARKER" 2>/dev/null | tr -d '[:space:]')
+	if [ -n "$marker_id" ] && [ -f /etc/sshush/config.json ]; then
+		own_id=$(sed -n 's/.*"agent_id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' /etc/sshush/config.json 2>/dev/null | head -n 1)
+		if [ -n "$own_id" ] && [ "$marker_id" != "$own_id" ]; then
+			step "marker is scoped to a different agent; ignoring it"
+			rm -f "$MARKER"
+			exit 0
+		fi
+	fi
 fi
 
 step "removing SSHush"
